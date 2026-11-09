@@ -23,6 +23,11 @@ data class StackOptions(
     val luckyKeepFraction: Float = 0.4f,
     val sigma: Float = 2.5f,
     val jpegQuality: Int = 95,
+    /**
+     * With [align]: per-tile shifts on top of the global one, for scenes whose parts move differently
+     * (stars rotating over a static foreground in long series). The middle frame becomes the reference.
+     */
+    val localAlign: Boolean = false,
 )
 
 data class FrameReport(
@@ -30,13 +35,18 @@ data class FrameReport(
     val accepted: Boolean,
     /** null | "motion" | "brightness_outlier" | "not_sharpest" | "align_failed" */
     val rejectReason: String?,
-    /** Applied shift in full-resolution pixels: frame pixel (x, y) lands on reference pixel (x + dx, y + dy). */
+    /**
+     * Applied shift in full-resolution pixels: frame pixel (x, y) lands on reference pixel (x + dx, y + dy).
+     * With local alignment the shift varies over the frame; this is its value at the image centre.
+     */
     val dx: Int,
     val dy: Int,
     /** Variance of the Laplacian of the downscaled luminance (relative, compare within a series). */
     val sharpness: Double,
     /** Mean luminance 0..255 of the downscaled frame. */
     val meanLuma: Double,
+    /** Local alignment only: share of tiles matched confidently to the reference (others were interpolated). */
+    val alignConfidence: Double? = null,
 )
 
 data class StackResult(
