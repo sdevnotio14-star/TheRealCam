@@ -49,6 +49,8 @@ data class AppSettings(
     val edgeMode: Int = -1,
     /** Camera2 LENS_OPTICAL_STABILIZATION_MODE, -1 = camera default. */
     val oisMode: Int = -1,
+    /** Manual setups saved by the user (СЦЕНЫ mode). */
+    val userPresets: List<UserPreset> = emptyList(),
 )
 
 class SettingsRepository(private val context: Context) {
@@ -76,6 +78,7 @@ class SettingsRepository(private val context: Context) {
         val noiseReduction = intPreferencesKey("noise_reduction")
         val edgeMode = intPreferencesKey("edge_mode")
         val oisMode = intPreferencesKey("ois_mode")
+        val userPresets = stringPreferencesKey("user_presets")
     }
 
     val settings: Flow<AppSettings> = context.dataStore.data.map { it.toSettings() }
@@ -108,6 +111,7 @@ class SettingsRepository(private val context: Context) {
             noiseReduction = this[K.noiseReduction] ?: d.noiseReduction,
             edgeMode = this[K.edgeMode] ?: d.edgeMode,
             oisMode = this[K.oisMode] ?: d.oisMode,
+            userPresets = UserPresets.decode(this[K.userPresets]),
         )
     }
 
@@ -135,6 +139,14 @@ class SettingsRepository(private val context: Context) {
     suspend fun setNoiseReduction(v: Int) = context.dataStore.edit { it[K.noiseReduction] = v }
     suspend fun setEdgeMode(v: Int) = context.dataStore.edit { it[K.edgeMode] = v }
     suspend fun setOisMode(v: Int) = context.dataStore.edit { it[K.oisMode] = v }
+
+    suspend fun saveUserPreset(p: UserPreset) = context.dataStore.edit {
+        it[K.userPresets] = UserPresets.encode(UserPresets.decode(it[K.userPresets]).filter { u -> u.id != p.id } + p)
+    }
+
+    suspend fun deleteUserPreset(id: String) = context.dataStore.edit {
+        it[K.userPresets] = UserPresets.encode(UserPresets.decode(it[K.userPresets]).filter { u -> u.id != id })
+    }
 
     suspend fun setActiveModel(fileName: String?) = context.dataStore.edit {
         if (fileName == null) it.remove(K.activeModel) else it[K.activeModel] = fileName

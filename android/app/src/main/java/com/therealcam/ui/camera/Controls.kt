@@ -1,9 +1,11 @@
 package com.therealcam.ui.camera
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,10 +25,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.BookmarkAdd
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -45,6 +50,8 @@ import com.therealcam.ai.AstroPlanner
 import com.therealcam.ai.engine.TrcmModel
 import com.therealcam.capture.PresetPlanner
 import com.therealcam.capture.ScenePreset
+import com.therealcam.data.UserPreset
+import com.therealcam.ui.common.CategoryDialog
 import com.therealcam.camera.CameraCaps
 import com.therealcam.camera.CameraMode
 import com.therealcam.camera.ExposureScale
@@ -368,7 +375,8 @@ fun AstroControls(
     }
 }
 
-/** СЦЕНЫ mode: scene buttons with icons, the plan for the chosen one and what it does. */
+/** СЦЕНЫ mode: scene buttons with icons (built-in, then the user's own), the plan and what it does. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun PresetControls(
     preset: ScenePreset,
@@ -376,35 +384,78 @@ fun PresetControls(
     steady: Boolean,
     orientation: Float,
     onPreset: (ScenePreset) -> Unit,
+    userPresets: List<UserPreset> = emptyList(),
+    selectedUser: String? = null,
+    onUser: (String) -> Unit = {},
+    onDeleteUser: (String) -> Unit = {},
 ) {
+    var deleting by remember { mutableStateOf<UserPreset?>(null) }
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         val state = rememberLazyListState()
-        val idx = ScenePreset.entries.indexOf(preset)
+        val idx = if (selectedUser != null) ScenePreset.entries.size + userPresets.indexOfFirst { it.id == selectedUser }
+        else ScenePreset.entries.indexOf(preset)
         LaunchedEffect(idx) { if (idx >= 0) state.animateScrollToItem((idx - 2).coerceAtLeast(0)) }
         LazyRow(state = state, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             itemsIndexed(ScenePreset.entries) { _, p ->
-                val sel = p == preset
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.width(62.dp).clip(RoundedCornerShape(10.dp)).clickable { onPreset(p) }.padding(vertical = 2.dp),
-                ) {
-                    Box(
-                        Modifier.size(40.dp).clip(CircleShape).background(if (sel) RealColors.Accent else RealColors.SurfaceHigh),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(SceneIcons.of(p.icon), p.title, tint = if (sel) Color.Black else Color.White,
-                            modifier = Modifier.size(22.dp).rotate(orientation))
-                    }
-                    Text(p.title, fontSize = 10.sp, maxLines = 1, color = if (sel) RealColors.Accent else RealColors.TextDim)
-                }
+                PresetButton(p.icon, p.title, selectedUser == null && p == preset, orientation, Modifier.clickable { onPreset(p) })
+            }
+            itemsIndexed(userPresets) { _, u ->
+                PresetButton(
+                    u.icon, u.name, u.id == selectedUser, orientation,
+                    Modifier.combinedClickable(onClick = { onUser(u.id) }, onLongClick = { deleting = u }),
+                    mine = true,
+                )
             }
         }
         Text(plan?.label ?: "Смотрю на сцену…", color = Color.White, fontSize = 12.sp, maxLines = 1)
         val warn = plan?.needsTripod == true && !steady
         Text(plan?.hint ?: "", color = if (warn) RealColors.Warn else RealColors.TextDim, fontSize = 11.sp, maxLines = 2)
+    }
+    deleting?.let { u ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("Удалить пресет «${u.name}»?") },
+            confirmButton = { TextButton(onClick = { deleting = null; onDeleteUser(u.id) }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("Отмена") } },
+        )
+    }
+}
+
+@Composable
+private fun PresetButton(icon: String, title: String, sel: Boolean, orientation: Float, click: Modifier, mine: Boolean = false) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.width(62.dp).clip(RoundedCornerShape(10.dp)).then(click).padding(vertical = 2.dp),
+    ) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape).background(if (sel) RealColors.Accent else RealColors.SurfaceHigh)
+                .border(if (mine) 1.dp else 0.dp, if (mine) RealColors.AccentDim else Color.Transparent, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(SceneIcons.of(icon), title, tint = if (sel) Color.Black else Color.White, modifier = Modifier.size(22.dp).rotate(orientation))
+        }
+        Text(title, fontSize = 10.sp, maxLines = 1, color = if (sel) RealColors.Accent else RealColors.TextDim)
+    }
+}
+
+/** Manual mode: saves the current settings as a preset of the СЦЕНЫ mode. */
+@Composable
+fun SavePresetButton(onSave: (name: String, icon: String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    TextButton(onClick = { open = true }) {
+        Icon(Icons.Filled.BookmarkAdd, null, tint = RealColors.Accent, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Сохранить как пресет", color = RealColors.Accent, fontSize = 12.sp)
+    }
+    if (open) {
+        CategoryDialog(
+            title = "Новый пресет",
+            onDismiss = { open = false },
+            onConfirm = { name, icon -> open = false; onSave(name, icon) },
+        )
     }
 }

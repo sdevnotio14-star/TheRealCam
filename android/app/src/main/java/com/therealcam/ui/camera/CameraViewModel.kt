@@ -36,6 +36,7 @@ import com.therealcam.data.AppSettings
 import com.therealcam.data.Profile
 import com.therealcam.data.SceneKeys
 import com.therealcam.data.StackMode
+import com.therealcam.data.UserPreset
 import com.therealcam.data.db.CaptureEntity
 import com.therealcam.data.db.CategoryEntity
 import com.therealcam.dataset.AiInfo
@@ -348,30 +349,58 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             setMode(CameraMode.ASTRO)
             return
         }
+        _userPreset.value = null
         _preset.value = p
         viewModelScope.launch { g.settings.setLastPreset(p.key) }
         camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
         applyPreviewSettings()
     }
 
+    /** Selected user preset id in the СЦЕНЫ mode; null = a built-in scene. */
+    private val _userPreset = MutableStateFlow<String?>(null)
+    val userPreset = _userPreset.asStateFlow()
+
+    fun setUserPreset(id: String) {
+        if (_busy.value != null) return
+        _userPreset.value = id
+        camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
+        applyPreviewSettings()
+    }
+
+    /** Manual mode: keep the current settings as a preset of the СЦЕНЫ mode. */
+    fun saveManualAsPreset(name: String, icon: String) = viewModelScope.launch {
+        val id = "u" + System.currentTimeMillis().toString(36)
+        g.settings.saveUserPreset(UserPreset.from(id, name, icon, _shot.value.copy(torch = false), hintProfile()))
+        _message.value = "Пресет «$name» сохранён — он в режиме СЦЕНЫ"
+    }
+
+    fun deleteUserPreset(id: String) = viewModelScope.launch {
+        g.settings.deleteUserPreset(id)
+        if (_userPreset.value == id) {
+            _userPreset.value = null
+            camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
+            applyPreviewSettings()
+        }
+    }
+
+    private fun selectedUserPreset(): UserPreset? = _userPreset.value?.let { id -> settings.value.userPresets.firstOrNull { it.id == id } }
+
     private fun presetPlan(caps: CameraCaps): PresetPlanner.Plan {
         val p = camera.preview.value
-        return PresetPlanner.plan(
-            _preset.value,
-            PresetPlanner.Input(
-                manualSensor = caps.manualSensor,
-                minExpNs = caps.exposureRange?.lower,
-                maxExpNs = caps.exposureRange?.upper,
-                minIso = caps.isoRange?.lower,
-                maxIso = caps.isoRange?.upper,
-                canFocusInfinity = caps.canManualFocus,
-                aperture = p?.aperture ?: caps.apertures.firstOrNull(),
-                previewExpNs = p?.exposureNs,
-                previewIso = p?.iso,
-                previewMeanLin = lastMeanLin,
-                steady = motion.value.steady,
-            ),
+        val input = PresetPlanner.Input(
+            manualSensor = caps.manualSensor,
+            minExpNs = caps.exposureRange?.lower,
+            maxExpNs = caps.exposureRange?.upper,
+            minIso = caps.isoRange?.lower,
+            maxIso = caps.isoRange?.upper,
+            canFocusInfinity = caps.canManualFocus,
+            aperture = p?.aperture ?: caps.apertures.firstOrNull(),
+            previewExpNs = p?.exposureNs,
+            previewIso = p?.iso,
+            previewMeanLin = lastMeanLin,
+            steady = motion.value.steady,
         )
+        return selectedUserPreset()?.let { PresetPlanner.planUser(it, input) } ?: PresetPlanner.plan(_preset.value, input)
     }
 
     private fun astroPlan(caps: CameraCaps, durationS: Int = settings.value.astroDurationS): AstroPlanner.Plan {
@@ -508,8 +537,9 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         CameraMode.PRESET -> {
             val caps = camera.caps.value
             when {
-                // The moon is exposed manually from the start: auto exposure would burn the disc against the black sky.
-                _preset.value == ScenePreset.MOON && caps != null -> presetPlan(caps).settings.copy(frames = 1, torch = _torch.value)
+                // User presets and the moon are previewed with their own manual exposure.
+                caps != null && (selectedUserPreset() != null || _preset.value == ScenePreset.MOON) ->
+                    presetPlan(caps).settings.copy(frames = 1, torch = _torch.value)
                 _preset.value in INFINITY_PRESETS && caps?.canManualFocus == true -> ShotSettings(focus = FocusMode.INFINITY, torch = _torch.value)
                 else -> ShotSettings(torch = _torch.value)
             }
@@ -713,10 +743,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             }
             CameraMode.PRESET -> {
                 val p = _preset.value
+                val user = selectedUserPreset()
+                val profile = user?.let { Profile.of(it.profile) } ?: p.profile
                 val settings = (camera.caps.value?.let { presetPlan(it).settings } ?: _presetPlan.value?.settings ?: ShotSettings())
                     .copy(torch = _torch.value)
-                val cat = hint ?: categories.value.firstOrNull { SceneKeys.profileOf(it.icon) == p.profile }?.id
-                ShotRunner.Plan(CameraMode.PRESET, settings, p.profile, cat, null, app.timerSeconds, preset = p.key)
+                val cat = hint ?: categories.value.firstOrNull { SceneKeys.profileOf(it.icon) == profile }?.id
+                ShotRunner.Plan(CameraMode.PRESET, settings, profile, cat, null, app.timerSeconds, preset = if (user != null) "user" else p.key)
             }
             CameraMode.AI -> {
                 val m = model.value

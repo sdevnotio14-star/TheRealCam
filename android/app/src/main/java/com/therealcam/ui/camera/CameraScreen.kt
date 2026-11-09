@@ -209,9 +209,12 @@ fun CameraScreen(
                             vm::setIso, vm::setShutter, vm::updateShot, vm::setFrames,
                         )
                         HintRow(vm.categories.collectAsState().value, vm.categoryHint.collectAsState().value, rot, vm::setCategoryHint)
+                        SavePresetButton { name, icon -> vm.saveManualAsPreset(name, icon) }
                     }
                     CameraMode.PRESET -> PresetControls(
                         vm.preset.collectAsState().value, vm.presetPlan.collectAsState().value, motion.steady, rot, vm::setPreset,
+                        userPresets = settings.userPresets, selectedUser = vm.userPreset.collectAsState().value,
+                        onUser = vm::setUserPreset, onDeleteUser = { vm.deleteUserPreset(it) },
                     )
                     CameraMode.ASTRO -> AstroControls(
                         vm.astro.collectAsState().value, settings.astroDurationS, settings.voice, motion.steady,

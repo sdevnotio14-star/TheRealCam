@@ -1,7 +1,11 @@
 package com.therealcam.capture
 
 import com.therealcam.camera.FocusMode
+import com.therealcam.camera.ShotSettings
+import com.therealcam.data.Profile
 import com.therealcam.data.StackMode
+import com.therealcam.data.UserPreset
+import com.therealcam.data.UserPresets
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -76,5 +80,25 @@ class PresetPlannerTest {
     fun presetKeysRoundTrip() {
         ScenePreset.entries.forEach { assertEquals(it, ScenePreset.of(it.key)) }
         assertEquals(ScenePreset.NIGHT, ScenePreset.of("unknown"))
+    }
+
+    @Test
+    fun userPresetIsKeptAndLimitedToTheCamera() {
+        val saved = UserPreset.from(
+            "u1", "Мои звёзды", "stars",
+            ShotSettings(iso = 25_600, exposureNs = 60_000_000_000L, focus = FocusMode.INFINITY, frames = 10, stackMode = StackMode.SIGMA_CLIP),
+            Profile.ASTRO,
+        )
+        val back = UserPresets.decode(UserPresets.encode(listOf(saved)))
+        assertEquals(listOf(saved), back)
+        val p = PresetPlanner.planUser(back.single(), input(steady = true))
+        assertEquals(6400, p.settings.iso)
+        assertEquals(30_000_000_000L, p.settings.exposureNs)
+        assertEquals(10, p.settings.frames)
+        assertEquals(StackMode.SIGMA_CLIP, p.settings.stackMode)
+        assertTrue(p.needsTripod)
+        val noManual = PresetPlanner.planUser(saved, input(manual = false))
+        assertNull(noManual.settings.exposureNs)
+        assertTrue(UserPresets.decode("not json").isEmpty())
     }
 }
