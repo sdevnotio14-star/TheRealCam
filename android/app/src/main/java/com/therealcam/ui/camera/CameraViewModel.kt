@@ -103,6 +103,9 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     /** Exposure meter of the last analysed preview, EV relative to mid-grey. */
     private val _meterEv = MutableStateFlow<Double?>(null)
     val meterEv = _meterEv.asStateFlow()
+    /** Live histogram in manual mode when pro mode is on (see [Histogram]). */
+    private val _histogram = MutableStateFlow<FloatArray?>(null)
+    val histogram = _histogram.asStateFlow()
 
     private var lensSpecs: LensProbe.Specs? = null
     /** Lenses of the current side (back or front), sorted by zoom, macro last. */
@@ -552,6 +555,9 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 lastMeanLin = result.first
                 _meterEv.value = ln(maxOf(result.first, 1e-5) / 0.18) / ln(2.0)
+                _histogram.value = if (_mode.value == CameraMode.MANUAL && settings.value.proMode) {
+                    withContext(Dispatchers.Default) { Histogram.of(scene.px) }
+                } else null
                 if (_mode.value == CameraMode.ASTRO) {
                     _astro.value = astroPlan(caps)
                     continue

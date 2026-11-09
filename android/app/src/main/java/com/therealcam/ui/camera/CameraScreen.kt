@@ -146,6 +146,9 @@ fun CameraScreen(
                 PreviewView(vm, Modifier.fillMaxSize())
                 if (settings.grid) GridOverlay()
                 if (settings.level) LevelOverlay(motion.rollDeg, motion.pitchDeg, motion.deviceOrientation)
+                if (mode == CameraMode.MANUAL) {
+                    vm.histogram.collectAsState().value?.let { HistogramOverlay(it, Modifier.align(Alignment.TopStart).padding(10.dp)) }
+                }
                 FocusTapLayer(enabled = busy == null, onTap = { u, v -> vm.focusAt(u, v) }, onPinch = vm::onPinch, onPinchEnd = vm::onPinchEnd)
                 if (busy == null && countdown == null) {
                     ZoomBar(
