@@ -83,7 +83,11 @@ class StackProcessor {
     }
 
     private fun describe(mode: StackMode, plan: StackPlan, total: Int): String =
-        "TheRealCam stack: ${mode.key} ${plan.usedFrames}/$total frames" + if (plan.aligned) " aligned" else ""
+        "TheRealCam stack: ${mode.key} ${plan.usedFrames}/$total frames" + when {
+            plan.localAligned -> " aligned locally"
+            plan.aligned -> " aligned"
+            else -> ""
+        }
 
     /** Total light-gathering time of an averaged stack; null if any used frame's exposure is unknown. */
     private fun summedExposureSeconds(mode: StackMode, frames: List<StackFrame>, layers: List<Layer>): Double? {

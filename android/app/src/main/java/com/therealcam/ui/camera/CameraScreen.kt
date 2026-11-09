@@ -1,7 +1,9 @@
 package com.therealcam.ui.camera
 
+import android.app.Activity
 import android.graphics.SurfaceTexture
 import android.view.TextureView
+import android.view.WindowManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -54,6 +56,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -98,6 +101,7 @@ fun CameraScreen(
     val lens by vm.lens.collectAsState()
     val zoom by vm.zoom.collectAsState()
     val rot = rotationFor(motion.deviceOrientation)
+    DimWhile(busy != null && mode == CameraMode.ASTRO)
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
@@ -238,6 +242,20 @@ fun CameraScreen(
         }
 
         ratingFor?.let { id -> RatingOverlay(vm, id, onDetails = { onGallery(id) }) }
+    }
+}
+
+/** Dims the screen during long astro captures: saves battery and keeps night vision. */
+@Composable
+private fun DimWhile(dim: Boolean) {
+    val window = (LocalContext.current as? Activity)?.window
+    DisposableEffect(dim, window) {
+        if (dim && window != null) window.attributes = window.attributes.apply { screenBrightness = 0.03f }
+        onDispose {
+            if (dim && window != null) {
+                window.attributes = window.attributes.apply { screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
+            }
+        }
     }
 }
 
