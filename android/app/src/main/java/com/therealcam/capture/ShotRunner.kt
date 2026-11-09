@@ -157,6 +157,7 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
                 align = plan.profile.align,
                 rejectOutlierFrames = plan.profile.rejectOutlierFrames,
                 jpegQuality = env.app.jpegQuality,
+                localAlign = plan.profile == Profile.ASTRO,
             ),
             output = resultFile,
             onProgress = { onProgress(Progress.Merging(it)) },
