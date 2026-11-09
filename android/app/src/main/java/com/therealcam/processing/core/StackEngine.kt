@@ -25,6 +25,42 @@ internal interface FrameSource {
 
     /** Full-resolution ARGB of a rect inside the image. May be called concurrently for different frames. */
     fun readRegion(position: Int, left: Int, top: Int, width: Int, height: Int, dst: IntArray, dstOffset: Int, dstStride: Int)
+
+    /**
+     * Luminance at 1/[sampleSize] of full resolution (box average) for refining local alignment; null if the
+     * frame cannot be read. Implementations may decode faster (JPEG DCT scaling).
+     */
+    fun scaledLuma(position: Int, sampleSize: Int): Luma8? {
+        val s = sampleSize.coerceAtLeast(1)
+        val w = width / s
+        val h = height / s
+        if (w == 0 || h == 0) return null
+        val out = ByteArray(w * h)
+        val band = max(1, 64 / s)
+        val buf = IntArray(band * s * width)
+        val area = s * s
+        var y = 0
+        while (y < h) {
+            val rows = min(band, h - y)
+            try {
+                readRegion(position, 0, y * s, width, rows * s, buf, 0, width)
+            } catch (e: IOException) {
+                return null
+            }
+            for (r in 0 until rows) {
+                for (x in 0 until w) {
+                    var sum = 0
+                    for (j in 0 until s) {
+                        var i = (r * s + j) * width + x * s
+                        for (k in 0 until s) sum += luma8(buf[i++])
+                    }
+                    out[(y + r) * w + x] = ((sum + area / 2) / area).toByte()
+                }
+            }
+            y += rows
+        }
+        return Luma8(w, h, out)
+    }
 }
 
 /** Receives finished output rows [y0, y0 + rows) (row stride = image width), in order, from one coroutine. */
@@ -32,8 +68,11 @@ internal fun interface StripSink {
     fun write(y0: Int, rows: Int, argb: IntArray)
 }
 
-/** A frame placed with its applied shift (frame pixel (x, y) -> output (x + dx, y + dy)). */
-internal data class Layer(val position: Int, val dx: Int, val dy: Int)
+/**
+ * A frame placed with its applied shift (frame pixel (x, y) -> output (x + dx, y + dy)). With a [field] the
+ * shift varies per pixel (local alignment) and dx/dy are only its value at the image centre.
+ */
+internal data class Layer(val position: Int, val dx: Int, val dy: Int, val field: OffsetField? = null)
 
 internal sealed interface PlannedOutput {
     /** Output is a byte copy of this frame's file. */
@@ -49,6 +88,8 @@ internal class StackPlan(
     val reference: Int,
     val output: PlannedOutput,
     val aligned: Boolean,
+    /** Layers carry per-tile offset fields. */
+    val localAligned: Boolean = false,
 ) {
     val usedFrames: Int
         get() = when (output) {
@@ -82,6 +123,7 @@ internal class StackEngine(
     /** Fixed strip height (tests); 0 = derive from the budget. */
     private val stripRowsOverride: Int = 0,
     private val alignConfig: AlignConfig = AlignConfig(),
+    private val localConfig: LocalAlignConfig = LocalAlignConfig(),
 ) {
 
     suspend fun plan(
@@ -122,29 +164,77 @@ internal class StackEngine(
             FrameStats(means[i], sharpness[i], frames[i].motionRms, usable)
         }
 
+        val merges = options.mode in MERGE_MODES
+        val local = merges && options.align && options.localAlign
         val selection = FrameSelector.select(
             stats, options.mode, options.rejectOutlierFrames, options.maxMotionRadS, options.luckyKeepFraction,
+            middleReference = local,
         )
         val reasons = selection.reasons
         val ref = selection.reference
         val dx = IntArray(n)
         val dy = IntArray(n)
-        val merges = options.mode in MERGE_MODES
+        val fields = arrayOfNulls<OffsetField>(n)
+        val confidence = arrayOfNulls<Double>(n)
         val targets = reasons.indices.filter { reasons[it] == null && it != ref }
         val aligned = merges && options.align && targets.isNotEmpty()
-        if (aligned) align(source, lumas, ref, targets, dx, dy, reasons, progress)
+        if (aligned) {
+            val global = align(source, lumas, ref, targets, progress, 0.5f, if (local) 0.75f else 1f)
+            val localResult = if (local) alignLocal(source, lumas, ref, targets, global, progress) else null
+            val failed = localResult?.failed
+            for ((k, i) in targets.withIndex()) {
+                if (localResult != null && failed != null) {
+                    // Global verdicts are deferred: with field rotation, far frames match poorly as a whole.
+                    confidence[i] = localResult.confidence[k]
+                    if (failed[k]) {
+                        reasons[i] = RejectReason.ALIGN_FAILED
+                    } else {
+                        val f = localResult.fields[k]
+                        fields[i] = f
+                        dx[i] = f.centreDx()
+                        dy[i] = f.centreDy()
+                    }
+                } else {
+                    when (global.verdicts[k]) {
+                        AlignVerdict.OK -> {
+                            dx[i] = global.dx[k]
+                            dy[i] = global.dy[k]
+                        }
+                        AlignVerdict.FAILED -> reasons[i] = RejectReason.ALIGN_FAILED
+                        AlignVerdict.NO_STRUCTURE -> Unit
+                    }
+                }
+            }
+        }
         progress.report(1f)
 
         val used = listOf(ref) + reasons.indices.filter { reasons[it] == null && it != ref }
         val output = if (!merges || used.size == 1) {
             PlannedOutput.Copy(ref)
         } else {
-            PlannedOutput.Merge(used.map { Layer(it, dx[it], dy[it]) })
+            PlannedOutput.Merge(used.map { Layer(it, dx[it], dy[it], fields[it]) })
         }
         val reports = List(n) { i ->
-            FrameReport(frames[i].index, reasons[i] == null, reasons[i], dx[i], dy[i], sharpness[i], means[i])
+            FrameReport(frames[i].index, reasons[i] == null, reasons[i], dx[i], dy[i], sharpness[i], means[i], confidence[i])
         }
-        StackPlan(reports, ref, output, aligned)
+        val localAligned = output is PlannedOutput.Merge && output.layers.any { it.field != null }
+        StackPlan(reports, ref, output, aligned, localAligned)
+    }
+
+    /** Global shift estimates per target (also for frames judged FAILED) and their verdicts. */
+    private class GlobalAlignment(val dx: IntArray, val dy: IntArray, val verdicts: Array<AlignVerdict>)
+
+    private suspend fun alignLocal(
+        source: FrameSource, lumas: Array<Luma8?>, ref: Int, targets: List<Int>, global: GlobalAlignment, progress: Progress,
+    ): LocalResult? {
+        val m = targets.size
+        val noStructure = BooleanArray(m) { global.verdicts[it] == AlignVerdict.NO_STRUCTURE }
+        return LocalAligner(localConfig, workers).align(
+            source, lumas, ref, targets,
+            IntArray(m) { if (noStructure[it]) 0 else global.dx[it] },
+            IntArray(m) { if (noStructure[it]) 0 else global.dy[it] },
+            BooleanArray(m) { global.verdicts[it] == AlignVerdict.OK },
+        ) { progress.report(0.75f + 0.25f * it) }
     }
 
     private suspend fun align(
@@ -152,11 +242,10 @@ internal class StackEngine(
         lumas: Array<Luma8?>,
         ref: Int,
         targets: List<Int>,
-        dx: IntArray,
-        dy: IntArray,
-        reasons: Array<String?>,
         progress: Progress,
-    ) {
+        progressFrom: Float,
+        progressTo: Float,
+    ): GlobalAlignment {
         val cfg = alignConfig
         val searcher = TranslationSearcher(cfg)
         val refLuma = lumas[ref]!!
@@ -191,21 +280,9 @@ internal class StackEngine(
             }
             fx[k] = sx
             fy[k] = sy
-            progress.report(0.5f + 0.5f * done.incrementAndGet() / m)
+            progress.report(progressFrom + (progressTo - progressFrom) * done.incrementAndGet() / m)
         }
-
-        val verdicts = judgeAlignment(ncc, z, cfg)
-        for (k in 0 until m) {
-            val i = targets[k]
-            when (verdicts[k]) {
-                AlignVerdict.OK -> {
-                    dx[i] = fx[k]
-                    dy[i] = fy[k]
-                }
-                AlignVerdict.FAILED -> reasons[i] = RejectReason.ALIGN_FAILED
-                AlignVerdict.NO_STRUCTURE -> Unit
-            }
-        }
+        return GlobalAlignment(fx, fy, judgeAlignment(ncc, z, cfg))
     }
 
     private class Crop(val hp: LumaPlane, val left: Int, val top: Int)
@@ -238,6 +315,8 @@ internal class StackEngine(
     /**
      * Merges [layers] at full resolution in horizontal strips. Memory is bounded by the strip buffers:
      * SIGMA_CLIP/LUCKY hold one strip per layer, MEAN/LIGHTEN stream layers through running accumulators.
+     * Layers with an offset field are resampled per pixel (rounded shifts, whole source pixels) from a
+     * per-worker band of source rows; pixels whose source lies outside a frame are missing for that frame.
      * Output pixels covered by no layer are black (cannot happen when the zero-shift reference is included).
      */
     suspend fun merge(
@@ -267,7 +346,8 @@ internal class StackEngine(
         sink: StripSink, progress: Progress,
     ) {
         val n = layers.size
-        val rows = stripRows(width, height, n + 1)
+        val bands = LocalBands.of(layers, width, workers, memoryBudgetBytes)
+        val rows = stripRows(width, height, n + 1, bands)
         val strips = Array(n) { FrameStrip() }
         val scratch = Array(workers) { MergeScratch(n) }
         val out = IntArray(rows * width)
@@ -275,7 +355,7 @@ internal class StackEngine(
         while (y0 < height) {
             val top = y0
             val h = min(rows, height - top)
-            parallelFor(n, workers) { j, _ -> fill(strips[j], layers[j], top, h, width, height, source) }
+            parallelFor(n, bands.workers) { j, w -> fill(strips[j], layers[j], top, h, width, height, source, bands, w) }
             parallelRanges(h, workers) { r0, r1, w ->
                 StripKernels.sigmaClipRows(strips, n, top, r0, r1, width, out, sigma, scratch[w])
             }
@@ -291,7 +371,8 @@ internal class StackEngine(
     ) {
         val n = layers.size
         val group = min(n, max(2, workers))
-        val rows = stripRows(width, height, group + if (mean) 5 else 2)
+        val bands = LocalBands.of(layers, width, workers, memoryBudgetBytes)
+        val rows = stripRows(width, height, group + if (mean) 5 else 2, bands)
         val size = rows * width
         val strips = Array(group) { FrameStrip() }
         val out = IntArray(size)
@@ -317,7 +398,7 @@ internal class StackEngine(
             while (start < n) {
                 val first = start
                 val c = min(group, n - first)
-                parallelFor(c, workers) { j, _ -> fill(strips[j], layers[first + j], top, h, width, height, source) }
+                parallelFor(c, bands.workers) { j, w -> fill(strips[j], layers[first + j], top, h, width, height, source, bands, w) }
                 parallelRanges(h, workers) { r0, r1, _ ->
                     for (j in 0 until c) {
                         if (mean) {

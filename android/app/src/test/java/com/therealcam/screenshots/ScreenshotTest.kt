@@ -15,12 +15,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.github.takahirom.roborazzi.captureRoboImage
+import com.therealcam.ai.AstroPlanner
+import com.therealcam.camera.CameraMode
 import com.therealcam.camera.Lens
 import com.therealcam.camera.LensCatalog
 import com.therealcam.camera.LensKind
 import com.therealcam.camera.LensSpec
+import com.therealcam.ui.camera.AstroControls
+import com.therealcam.ui.camera.ModeSwitcher
 import com.therealcam.ui.camera.ZoomBar
 import com.therealcam.ui.onboarding.OnboardingScreen
+import com.therealcam.ui.theme.RealColors
 import com.therealcam.ui.theme.RealTheme
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -105,5 +110,31 @@ class ScreenshotTest {
     @Test
     fun zoomBudgetMacro() = shot("zoom_3_budget_macro") {
         FakePreview("Бюджетный: основная + макро, выбрано макро", budgetLike, budgetLike.first { it.kind == LensKind.MACRO }, 1.09f)
+    }
+
+    private fun astroPlan(maxExpS: Double) = AstroPlanner.plan(
+        AstroPlanner.Input(
+            durationS = 240, manualSensor = true, focalMm = 5.4f, aperture = 1.8f, pixelPitchUm = 1.8f, equivMm = 26f,
+            digitalZoom = 1f, minExpNs = 100_000L, maxExpNs = (maxExpS * 1e9).toLong(), minIso = 50, maxIso = 6400,
+            canFocusInfinity = true, previewExpNs = 100_000_000L, previewIso = 3200, previewMeanLin = 0.004,
+        ),
+    )
+
+    @Composable
+    private fun AstroPanel(title: String, plan: AstroPlanner.Plan, steady: Boolean, voice: Boolean) {
+        Column(Modifier.background(Color.Black).fillMaxWidth().padding(vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, color = RealColors.TextDim, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+            AstroControls(plan, 240, voice, steady, onDuration = {}, onVoice = {})
+            ModeSwitcher(CameraMode.ASTRO, enabled = true, onMode = {})
+        }
+    }
+
+    @Test
+    fun astroControls() = shot("astro_controls") {
+        Column(Modifier.background(Color.Black).fillMaxWidth()) {
+            AstroPanel("Штатив, сенсор до 30 с", astroPlan(30.0), steady = true, voice = true)
+            AstroPanel("В руках, голос выключен", astroPlan(30.0), steady = false, voice = false)
+            AstroPanel("Бюджетный сенсор: выдержка до 0,5 с", astroPlan(0.5), steady = true, voice = true)
+        }
     }
 }
