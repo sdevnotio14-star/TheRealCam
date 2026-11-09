@@ -2,9 +2,12 @@ package com.therealcam.ui.camera
 
 import android.app.Application
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraManager
 import android.media.MediaActionSound
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.therealcam.ai.AstroPlanner
 import com.therealcam.ai.CapturePlan
 import com.therealcam.ai.CapturePlanner
 import com.therealcam.ai.SceneFeatures
@@ -12,16 +15,28 @@ import com.therealcam.ai.ScenePreview
 import com.therealcam.ai.engine.ModelOutput
 import com.therealcam.ai.engine.TrcmModel
 import com.therealcam.appGraph
+import com.therealcam.camera.CameraCaps
 import com.therealcam.camera.CameraController
 import com.therealcam.camera.CameraMode
 import com.therealcam.camera.ExposureScale
 import com.therealcam.camera.FocusMode
+import com.therealcam.camera.Lens
+import com.therealcam.camera.LensKind
+import com.therealcam.camera.LensProbe
+import com.therealcam.camera.LensUse
 import com.therealcam.camera.ShotSettings
+import com.therealcam.camera.ZoomMath
+import com.therealcam.capture.PresetPlanner
+import com.therealcam.capture.ScenePreset
 import com.therealcam.capture.ShotRunner
+import com.therealcam.capture.SpeechText
+import com.therealcam.capture.VoiceAnnouncer
+import com.therealcam.core.RootCamera
 import com.therealcam.data.AppSettings
 import com.therealcam.data.Profile
 import com.therealcam.data.SceneKeys
 import com.therealcam.data.StackMode
+import com.therealcam.data.UserPreset
 import com.therealcam.data.db.CaptureEntity
 import com.therealcam.data.db.CategoryEntity
 import com.therealcam.dataset.AiInfo
@@ -84,11 +99,46 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     val ratingFor = _ratingFor.asStateFlow()
     private val _message = MutableStateFlow<String?>(null)
     val message = _message.asStateFlow()
+    /** VIDEO mode: video session and recording. */
+    val video = VideoSession(
+        app, camera, g.settings, viewModelScope, deviceOrientation = { motion.value.deviceOrientation },
+        reopen = { openIfReady() }, message = { _message.value = it },
+    )
     private val _ai = MutableStateFlow<AiState?>(null)
     val ai = _ai.asStateFlow()
     /** Exposure meter of the last analysed preview, EV relative to mid-grey. */
     private val _meterEv = MutableStateFlow<Double?>(null)
     val meterEv = _meterEv.asStateFlow()
+    /** Live histogram in manual mode when pro mode is on (see [Histogram]). */
+    private val _histogram = MutableStateFlow<FloatArray?>(null)
+    val histogram = _histogram.asStateFlow()
+
+    private var lensSpecs: LensProbe.Specs? = null
+    /** Lenses of the current side (back or front), sorted by zoom, macro last. */
+    private val _lenses = MutableStateFlow<List<Lens>>(emptyList())
+    val lenses = _lenses.asStateFlow()
+    /** Highlighted lens; its camera is the one that is (or will be) open. */
+    private val _lens = MutableStateFlow<Lens?>(null)
+    val lens = _lens.asStateFlow()
+    /** Field of view relative to the main lens of this side: 0.6×, 1×, 2.5×… */
+    private val _zoom = MutableStateFlow(1f)
+    val zoom = _zoom.asStateFlow()
+    private var pinchZoom: Float? = null
+
+    /** Astro mode plan (frames × exposure · ISO), refreshed from the preview meter. */
+    private val _astro = MutableStateFlow<AstroPlanner.Plan?>(null)
+    val astro = _astro.asStateFlow()
+    /** Scene of the СЦЕНЫ mode and its plan, refreshed from the preview meter. */
+    private val _preset = MutableStateFlow(ScenePreset.NIGHT)
+    val preset = _preset.asStateFlow()
+    private val _presetPlan = MutableStateFlow<PresetPlanner.Plan?>(null)
+    val presetPlan = _presetPlan.asStateFlow()
+    /** Seconds left until a long series finishes capturing. */
+    private val _remainingS = MutableStateFlow<Int?>(null)
+    val remainingS = _remainingS.asStateFlow()
+    private var lastMeanLin: Double? = null
+    @Volatile private var etaRt: Long? = null
+    private var voice: VoiceAnnouncer? = null
 
     /** Provided by the UI while the preview view exists (main thread only). */
     var sceneGrabber: (() -> ScenePreview?)? = null
@@ -104,8 +154,27 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val s = g.settings.settings.first()
             _mode.value = CameraMode.of(s.lastMode)
+            // The camera may already be open in the photo configuration.
+            if (_mode.value == CameraMode.VIDEO) openIfReady()
             _categoryHint.value = s.lastCategoryHint
+            _preset.value = ScenePreset.of(s.lastPreset).takeIf { it != ScenePreset.STARS } ?: ScenePreset.NIGHT
             applyPreviewSettings()
+        }
+        viewModelScope.launch {
+            val manager = app.getSystemService(CameraManager::class.java)
+            val s = g.settings.current()
+            lensSpecs = withContext(Dispatchers.IO) {
+                // With root, unlock the vendor-hidden modules before the camera list is read.
+                if (s.proMode && s.rootCamera) runCatching { RootCamera.enable(app.packageName) }
+                runCatching { LensProbe.read(manager) }.getOrNull()
+            }
+            refreshLenses()
+        }
+        viewModelScope.launch {
+            settings.collect { s ->
+                camera.pro = if (s.proMode) CameraController.ProOptions(s.noiseReduction, s.edgeMode, s.oisMode)
+                else CameraController.ProOptions()
+            }
         }
     }
 
@@ -123,6 +192,14 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         if (settings.value.geotag) g.location.start()
         openIfReady()
         startAnalysis()
+        // Root may have been switched on in settings meanwhile: modules can appear or disappear.
+        if (lensSpecs != null) viewModelScope.launch {
+            val manager = getApplication<Application>().getSystemService(CameraManager::class.java)
+            withContext(Dispatchers.IO) { runCatching { LensProbe.read(manager) }.getOrNull() }?.let {
+                lensSpecs = it
+                if (_busy.value == null) refreshLenses()
+            }
+        }
     }
 
     fun onPause() {
@@ -131,7 +208,10 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         analysisJob?.cancel()
         g.sensors.release()
         g.location.stop()
-        viewModelScope.launch { camera.close() }
+        viewModelScope.launch {
+            video.stop()
+            camera.close()
+        }
     }
 
     fun observeCapture(id: String) = g.captures.observe(id)
@@ -143,40 +223,239 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     private fun openIfReady() {
         val t = texture ?: return
         if (!resumed) return
+        // A new session would cut the recording.
+        if (video.recording.value) return
         viewModelScope.launch {
             try {
                 val (back, frontId) = camera.cameraIds()
-                val id = (if (_front.value) frontId else back) ?: back ?: frontId ?: run {
+                val fallback = (if (_front.value) frontId else back) ?: back ?: frontId ?: run {
                     _message.value = "Камера не найдена"
                     return@launch
                 }
-                camera.open(id, t)
+                val l = _lens.value
+                camera.setZoomRatio(l?.ratioFor(_zoom.value) ?: 1f, applyNow = false)
+                if (_mode.value == CameraMode.VIDEO) video.open(l?.cameraId ?: fallback, t)
+                else camera.open(l?.cameraId ?: fallback, t)
                 applyPreviewSettings()
             } catch (e: Exception) {
-                _message.value = "Не удалось открыть камеру: ${e.message}"
+                val l = _lens.value
+                if (l != null && l.kind != LensKind.MAIN && l.kind != LensKind.FRONT && l.cameraId !in blockedIds) {
+                    // The vendor lists the module but does not let third-party apps open it: back to the main lens.
+                    blockedIds += l.cameraId
+                    _lens.value = null
+                    refreshLenses(reopen = false)
+                    _message.value = "${l.kind.title}: производитель не даёт открыть этот объектив сторонним приложениям"
+                    openIfReady()
+                } else {
+                    _message.value = "Не удалось открыть камеру: ${e.message}"
+                }
             }
         }
     }
 
+    /** Camera ids that failed to open; their lenses are no longer offered. */
+    private val blockedIds = mutableSetOf<String>()
+
+    /** Rebuilds the lens list for the current side and falls back to its main lens if needed. */
+    private fun refreshLenses(reopen: Boolean = true) {
+        val list = lensSpecs?.lenses(_front.value).orEmpty().filter { it.cameraId !in blockedIds }
+        _lenses.value = list
+        val cur = _lens.value
+        if (cur == null || cur !in list) {
+            val main = list.firstOrNull { it.kind == LensKind.MAIN || it.kind == LensKind.FRONT } ?: list.firstOrNull()
+            _lens.value = main
+            _zoom.value = main?.zoom ?: 1f
+            // The camera may already be open on the default id: only reopen if the main lens differs.
+            if (reopen && main != null && camera.caps.value != null && camera.caps.value?.id != main.cameraId) openIfReady()
+        }
+    }
+
+    /** Lens chip: switch lens (reopening the camera only when it is a different camera id). */
+    fun selectLens(l: Lens) {
+        if (_busy.value != null || _countdown.value != null) return
+        pinchZoom = null
+        val reopen = camera.caps.value?.id != l.cameraId
+        if (reopen && video.recording.value) {
+            _message.value = "Во время записи этот объектив не включить"
+            return
+        }
+        _lens.value = l
+        _zoom.value = l.zoom
+        camera.setZoomRatio(l.baseRatio, applyNow = !reopen)
+        if (reopen) openIfReady()
+    }
+
+    /** Digital zoom button ("2"): the best lens for [target], reopening only for another camera id. */
+    fun setZoom(target: Float) {
+        if (_busy.value != null || _countdown.value != null) return
+        pinchZoom = null
+        val list = _lenses.value
+        val range = ZoomMath.range(list)
+        val t = target.coerceIn(range.start, range.endInclusive)
+        val best = ZoomMath.lensFor(list, t) ?: return
+        val reopen = camera.caps.value?.id != best.cameraId
+        _lens.value = best
+        _zoom.value = t.coerceIn(best.minZoom, best.maxZoom)
+        camera.setZoomRatio(best.ratioFor(_zoom.value), applyNow = !reopen)
+        if (reopen) openIfReady()
+    }
+
+    /** Pinch on the preview: zoom on the open camera, switching lens when the gesture ends. */
+    fun onPinch(scale: Float) {
+        if (_busy.value != null || _countdown.value != null) return
+        val list = _lenses.value
+        val cur = _lens.value ?: return
+        val camId = camera.caps.value?.id ?: return
+        val range = ZoomMath.range(list)
+        val target = ((pinchZoom ?: _zoom.value) * scale).coerceIn(range.start, range.endInclusive)
+        pinchZoom = target
+        val lens = if (cur.kind == LensKind.MACRO) cur else {
+            ZoomMath.lensFor(list, target)?.takeIf { it.cameraId == camId }
+                ?: ZoomMath.lensFor(list.filter { it.cameraId == camId }, target)
+                ?: cur
+        }
+        val shown = target.coerceIn(lens.minZoom, lens.maxZoom)
+        _lens.value = lens
+        _zoom.value = shown
+        camera.setZoomRatio(lens.ratioFor(shown))
+    }
+
+    fun onPinchEnd() {
+        val target = pinchZoom ?: return
+        pinchZoom = null
+        if (_lens.value?.kind == LensKind.MACRO) return
+        val best = ZoomMath.lensFor(_lenses.value, target) ?: return
+        if (best.cameraId == camera.caps.value?.id) return
+        if (video.recording.value) return
+        // The requested view is better served by another camera id: switch to it now.
+        _lens.value = best
+        _zoom.value = target.coerceIn(best.minZoom, best.maxZoom)
+        camera.setZoomRatio(best.ratioFor(_zoom.value), applyNow = false)
+        openIfReady()
+    }
+
     override fun onCleared() {
+        video.release()
         camera.release()
         shutterSound.release()
+        voice?.shutdown()
     }
 
     // ------------------------------------------------------------ controls
 
     fun setMode(m: CameraMode) {
-        if (_mode.value == m) return
+        if (_mode.value == m || video.recording.value) return
+        val sessionChanges = (_mode.value == CameraMode.VIDEO) != (m == CameraMode.VIDEO)
         _mode.value = m
         _ai.value = null
         smoothed = null
         viewModelScope.launch { g.settings.setLastMode(m.key) }
+        if (m == CameraMode.ASTRO) camera.caps.value?.let { _astro.value = astroPlan(it) }
+        if (m == CameraMode.PRESET) camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
+        applyPreviewSettings()
+        // VIDEO uses its own session (16:9 preview + recorder surface instead of the JPEG reader).
+        if (sessionChanges) openIfReady()
+    }
+
+    fun setAstroDuration(s: Int) {
+        camera.caps.value?.let { _astro.value = astroPlan(it, s) }
+        viewModelScope.launch { g.settings.setAstroDurationS(s) }
+    }
+
+    fun setVoice(on: Boolean) = viewModelScope.launch { g.settings.setVoice(on) }
+
+    /** Scene button; "Звёзды" opens the АСТРО mode, which has its own controls. */
+    fun setPreset(p: ScenePreset) {
+        if (_busy.value != null) return
+        if (p == ScenePreset.STARS) {
+            setMode(CameraMode.ASTRO)
+            return
+        }
+        _userPreset.value = null
+        _preset.value = p
+        viewModelScope.launch { g.settings.setLastPreset(p.key) }
+        camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
         applyPreviewSettings()
     }
 
+    /** Selected user preset id in the СЦЕНЫ mode; null = a built-in scene. */
+    private val _userPreset = MutableStateFlow<String?>(null)
+    val userPreset = _userPreset.asStateFlow()
+
+    fun setUserPreset(id: String) {
+        if (_busy.value != null) return
+        _userPreset.value = id
+        camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
+        applyPreviewSettings()
+    }
+
+    /** Manual mode: keep the current settings as a preset of the СЦЕНЫ mode. */
+    fun saveManualAsPreset(name: String, icon: String) = viewModelScope.launch {
+        val id = "u" + System.currentTimeMillis().toString(36)
+        g.settings.saveUserPreset(UserPreset.from(id, name, icon, _shot.value.copy(torch = false), hintProfile()))
+        _message.value = "Пресет «$name» сохранён — он в режиме СЦЕНЫ"
+    }
+
+    fun deleteUserPreset(id: String) = viewModelScope.launch {
+        g.settings.deleteUserPreset(id)
+        if (_userPreset.value == id) {
+            _userPreset.value = null
+            camera.caps.value?.let { _presetPlan.value = presetPlan(it) }
+            applyPreviewSettings()
+        }
+    }
+
+    private fun selectedUserPreset(): UserPreset? = _userPreset.value?.let { id -> settings.value.userPresets.firstOrNull { it.id == id } }
+
+    private fun presetPlan(caps: CameraCaps): PresetPlanner.Plan {
+        val p = camera.preview.value
+        val input = PresetPlanner.Input(
+            manualSensor = caps.manualSensor,
+            minExpNs = caps.exposureRange?.lower,
+            maxExpNs = caps.exposureRange?.upper,
+            minIso = caps.isoRange?.lower,
+            maxIso = caps.isoRange?.upper,
+            canFocusInfinity = caps.canManualFocus,
+            aperture = p?.aperture ?: caps.apertures.firstOrNull(),
+            previewExpNs = p?.exposureNs,
+            previewIso = p?.iso,
+            previewMeanLin = lastMeanLin,
+            steady = motion.value.steady,
+        )
+        return selectedUserPreset()?.let { PresetPlanner.planUser(it, input) } ?: PresetPlanner.plan(_preset.value, input)
+    }
+
+    private fun astroPlan(caps: CameraCaps, durationS: Int = settings.value.astroDurationS): AstroPlanner.Plan {
+        val p = camera.preview.value
+        val l = _lens.value
+        return AstroPlanner.plan(
+            AstroPlanner.Input(
+                durationS = durationS,
+                manualSensor = caps.manualSensor,
+                focalMm = p?.focalLengthMm ?: caps.focalLengths.firstOrNull(),
+                aperture = p?.aperture ?: caps.apertures.firstOrNull(),
+                pixelPitchUm = caps.physicalSize?.let { it.width * 1000f / caps.jpegSize.width },
+                equivMm = l?.equivMm,
+                digitalZoom = l?.let { _zoom.value / it.zoom } ?: 1f,
+                minExpNs = caps.exposureRange?.lower,
+                maxExpNs = caps.exposureRange?.upper,
+                minIso = caps.isoRange?.lower,
+                maxIso = caps.isoRange?.upper,
+                canFocusInfinity = caps.canManualFocus,
+                previewExpNs = p?.exposureNs,
+                previewIso = p?.iso,
+                previewMeanLin = lastMeanLin,
+            ),
+        )
+    }
+
     fun switchCamera() {
+        if (_busy.value != null || video.recording.value) return
         _front.value = !_front.value
         _shot.value = ShotSettings(frames = _shot.value.frames, stackMode = _shot.value.stackMode)
+        pinchZoom = null
+        _lens.value = null
+        refreshLenses(reopen = false)
         openIfReady()
     }
 
@@ -243,7 +522,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun focusAt(u: Float, v: Float) {
         if (_mode.value == CameraMode.MANUAL && _shot.value.focus != FocusMode.AUTO) return
-        camera.focusAt(u, v)
+        camera.focusAt(if (_mode.value == CameraMode.VIDEO) video.tapU(u) else u, v)
     }
 
     fun pickAiClass(k: Int) {
@@ -276,7 +555,19 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     private fun previewSettings(): ShotSettings = when (_mode.value) {
         CameraMode.AUTO -> ShotSettings(ev = _autoEv.value, torch = _torch.value)
         CameraMode.MANUAL -> _shot.value.copy(torch = _torch.value)
+        CameraMode.ASTRO -> ShotSettings(focus = FocusMode.INFINITY, torch = _torch.value)
+        CameraMode.PRESET -> {
+            val caps = camera.caps.value
+            when {
+                // User presets and the moon are previewed with their own manual exposure.
+                caps != null && (selectedUserPreset() != null || _preset.value == ScenePreset.MOON) ->
+                    presetPlan(caps).settings.copy(frames = 1, torch = _torch.value)
+                _preset.value in INFINITY_PRESETS && caps?.canManualFocus == true -> ShotSettings(focus = FocusMode.INFINITY, torch = _torch.value)
+                else -> ShotSettings(torch = _torch.value)
+            }
+        }
         CameraMode.AI -> ShotSettings(torch = _torch.value)
+        CameraMode.VIDEO -> ShotSettings(torch = _torch.value)
     }
 
     private fun applyPreviewSettings() = camera.setShot(previewSettings())
@@ -294,7 +585,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             previewExposureNs = p?.exposureNs, previewIso = p?.iso, aperture = p?.aperture, lux = m.lux,
             pitchDeg = m.pitchDeg, rollDeg = m.rollDeg, gyroRms = m.gyroRms, timeMs = now,
             tzOffsetMs = TimeZone.getDefault().getOffset(now), lat = loc?.latitude, lon = loc?.longitude,
-            focusDiopters = p?.focusDiopters, zoom = p?.zoomRatio, front = camera.caps.value?.isFront == true,
+            focusDiopters = p?.focusDiopters, zoom = _zoom.value, front = camera.caps.value?.isFront == true,
         )
     }
 
@@ -303,20 +594,31 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         analysisJob = viewModelScope.launch {
             while (isActive) {
                 delay(if (_mode.value == CameraMode.AI) 450L else 800L)
-                if (_busy.value != null || _mode.value == CameraMode.AUTO) continue
+                if (_busy.value != null || _mode.value == CameraMode.AUTO || _mode.value == CameraMode.VIDEO) continue
                 val caps = camera.caps.value ?: continue
                 val scene = sceneGrabber?.invoke() ?: continue
                 val ctx = featureContext()
                 val m = model.value
                 val result = withContext(Dispatchers.Default) {
                     val stats = SceneFeatures.imageStats(scene.px, scene.w, scene.h)
-                    val meter = ln(maxOf(stats.meanLin, 1e-5) / 0.18) / ln(2.0)
                     val out = if (_mode.value == CameraMode.AI && m != null) {
                         runCatching { m.run(scene.thumb, SceneFeatures.compute(scene.px, scene.w, scene.h, ctx)) }.getOrNull()
                     } else null
-                    meter to out
+                    stats.meanLin to out
                 }
-                _meterEv.value = result.first
+                lastMeanLin = result.first
+                _meterEv.value = ln(maxOf(result.first, 1e-5) / 0.18) / ln(2.0)
+                _histogram.value = if (_mode.value == CameraMode.MANUAL && settings.value.proMode) {
+                    withContext(Dispatchers.Default) { Histogram.of(scene.px) }
+                } else null
+                if (_mode.value == CameraMode.ASTRO) {
+                    _astro.value = astroPlan(caps)
+                    continue
+                }
+                if (_mode.value == CameraMode.PRESET) {
+                    _presetPlan.value = presetPlan(caps)
+                    continue
+                }
                 val out = result.second
                 if (out == null || m == null || _mode.value != CameraMode.AI) continue
                 lastOutput = out
@@ -335,12 +637,23 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------ shutter
 
     fun onShutter() {
+        if (_mode.value == CameraMode.VIDEO) {
+            video.toggle()
+            return
+        }
         if (_busy.value != null || _countdown.value != null) return
         val caps = camera.caps.value ?: return
         _ratingFor.value = null
         shotJob = viewModelScope.launch {
             val app = settings.value
-            for (s in app.timerSeconds downTo 1) {
+            // Astro and tripod scenes: a short delay so pressing the shutter does not shake the first frame.
+            val tripodScene = _mode.value == CameraMode.PRESET && _presetPlan.value?.needsTripod == true && motion.value.steady
+            val timer = when {
+                _mode.value == CameraMode.ASTRO -> maxOf(app.timerSeconds, 3)
+                tripodScene -> maxOf(app.timerSeconds, 2)
+                else -> app.timerSeconds
+            }
+            for (s in timer downTo 1) {
                 _countdown.value = s
                 delay(1000)
             }
@@ -349,20 +662,65 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             val ctx = featureContext()
             val features = scene?.let { s -> withContext(Dispatchers.Default) { SceneFeatures.compute(s.px, s.w, s.h, ctx) } }
                 ?: SceneFeatures.NAMES.associateWith { null }
-            val plan = buildPlan(app)
+            val plan = buildPlan(app).copy(timerS = timer)
+            val expectedMs = plan.settings.frames.coerceAtLeast(1) * ShotRunner.plannedFrameMs(plan.settings)
+            val speak = app.voice && expectedMs >= SPEAK_MIN_MS
+            if (speak) speaker().say(SpeechText.start((expectedMs / 1000).toInt(), plan.mode == CameraMode.ASTRO))
+            etaRt = null
             _busy.value = ShotRunner.Progress.Capturing(0, plan.settings.frames, plan.settings.exposureNs)
+            val ticker = if (expectedMs >= COUNTDOWN_MIN_MS) launch { countdown(expectedMs, speak) } else null
             try {
                 val env = ShotRunner.Env(caps, camera.preview.value, scene, features, motion.value, location.value, app)
                 stopRequested = false
                 shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-                val e = withContext(Dispatchers.Default) { runner.run(plan, env, stop = { stopRequested }) { _busy.value = it } }
+                val e = withContext(Dispatchers.Default) {
+                    runner.run(plan, env, stop = { stopRequested }) { p ->
+                        if (p is ShotRunner.Progress.Capturing) etaRt = p.endEstimateRt
+                        _busy.value = p
+                    }
+                }
+                if (speak) speaker().say("Готово")
                 if (app.datasetMode && app.askRating) _ratingFor.value = e.id
             } catch (t: Throwable) {
-                if (t !is kotlinx.coroutines.CancellationException) _message.value = "Не удалось снять: ${t.message}"
+                if (t !is kotlinx.coroutines.CancellationException) {
+                    _message.value = "Не удалось снять: ${t.message}"
+                    if (speak) speaker().say("Не удалось снять")
+                }
             } finally {
+                ticker?.cancel()
+                _remainingS.value = null
+                etaRt = null
                 _busy.value = null
                 applyPreviewSettings()
             }
+        }
+    }
+
+    private fun speaker(): VoiceAnnouncer = voice ?: VoiceAnnouncer(getApplication()).also { voice = it }
+
+    /** Time left on screen and, if [speak], aloud on every 30-second mark ("Осталось 3 минуты"). */
+    private suspend fun countdown(expectedMs: Long, speak: Boolean) {
+        var step = SpeechText.tick(expectedMs, Int.MAX_VALUE).first
+        var mergingSaid = false
+        while (true) {
+            val b = _busy.value
+            val eta = etaRt
+            if (b is ShotRunner.Progress.Capturing && eta != null) {
+                val rem = eta - SystemClock.elapsedRealtime()
+                _remainingS.value = (rem / 1000).toInt().coerceAtLeast(0)
+                if (speak) {
+                    val (s, say) = SpeechText.tick(rem, step)
+                    step = s
+                    say?.let { speaker().say(SpeechText.remaining(it)) }
+                }
+            } else if (b is ShotRunner.Progress.Merging) {
+                _remainingS.value = null
+                if (speak && !mergingSaid) {
+                    mergingSaid = true
+                    speaker().say("Съёмка закончена, свожу кадры")
+                }
+            }
+            delay(500)
         }
     }
 
@@ -384,7 +742,17 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun buildPlan(app: AppSettings): ShotRunner.Plan {
+    private fun buildPlan(app: AppSettings): ShotRunner.Plan = basePlan(app).copy(lens = lensUse())
+
+    private fun lensUse(): LensUse? {
+        val l = _lens.value ?: return null
+        val z = _zoom.value
+        // Every lens's field of view is expressed relative to the main lens, so this holds for all of them.
+        val mainEq = _lenses.value.firstOrNull { it.kind == LensKind.MAIN || it.kind == LensKind.FRONT }?.equivMm
+        return LensUse(l.kind, z, mainEq?.times(z))
+    }
+
+    private fun basePlan(app: AppSettings): ShotRunner.Plan {
         val hint = _categoryHint.value?.takeIf { id -> categories.value.any { it.id == id } }
         return when (_mode.value) {
             CameraMode.AUTO -> ShotRunner.Plan(
@@ -393,6 +761,22 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             CameraMode.MANUAL -> ShotRunner.Plan(
                 CameraMode.MANUAL, _shot.value.copy(torch = _torch.value), hintProfile(), hint, null, app.timerSeconds,
             )
+            CameraMode.ASTRO -> {
+                val settings = camera.caps.value?.let { astroPlan(it).settings } ?: _astro.value?.settings
+                    ?: ShotSettings(focus = FocusMode.INFINITY, frames = 15, stackMode = StackMode.SIGMA_CLIP)
+                // Astro shots go to the user's astro category if there is one; it can be changed when rating.
+                val cat = hint ?: categories.value.firstOrNull { SceneKeys.profileOf(it.icon) == Profile.ASTRO }?.id
+                ShotRunner.Plan(CameraMode.ASTRO, settings, Profile.ASTRO, cat, null, app.timerSeconds)
+            }
+            CameraMode.PRESET -> {
+                val p = _preset.value
+                val user = selectedUserPreset()
+                val profile = user?.let { Profile.of(it.profile) } ?: p.profile
+                val settings = (camera.caps.value?.let { presetPlan(it).settings } ?: _presetPlan.value?.settings ?: ShotSettings())
+                    .copy(torch = _torch.value)
+                val cat = hint ?: categories.value.firstOrNull { SceneKeys.profileOf(it.icon) == profile }?.id
+                ShotRunner.Plan(CameraMode.PRESET, settings, profile, cat, null, app.timerSeconds, preset = if (user != null) "user" else p.key)
+            }
             CameraMode.AI -> {
                 val m = model.value
                 val st = _ai.value
@@ -409,9 +793,20 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     ShotRunner.Plan(CameraMode.AI, plan.settings.copy(torch = _torch.value), plan.profile, userCategory ?: hint, info, app.timerSeconds)
                 }
             }
+            // Not reached: the shutter records video in VIDEO mode.
+            CameraMode.VIDEO -> ShotRunner.Plan(
+                CameraMode.AUTO, ShotSettings(torch = _torch.value), hintProfile(), hint, null, app.timerSeconds,
+            )
         }
     }
 
     fun setTimer(seconds: Int) = viewModelScope.launch { g.settings.setTimerSeconds(seconds) }
     fun setGrid(on: Boolean) = viewModelScope.launch { g.settings.setGrid(on) }
+
+    private companion object {
+        /** Series at least this long show the time left; from [SPEAK_MIN_MS] it is also spoken. */
+        const val COUNTDOWN_MIN_MS = 10_000L
+        const val SPEAK_MIN_MS = 30_000L
+        val INFINITY_PRESETS = setOf(ScenePreset.CLOUDS, ScenePreset.SUNSET, ScenePreset.MOON, ScenePreset.TRAILS)
+    }
 }

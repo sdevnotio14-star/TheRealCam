@@ -1,0 +1,52 @@
+name: trainer-bin
+
+# Ready-to-run trainer for Windows and Linux (PyInstaller one-folder build with CPU PyTorch).
+on:
+  push:
+    paths: ['trainer/**', '.github/workflows/trainer-bin.yml']
+  pull_request:
+    paths: ['trainer/**', '.github/workflows/trainer-bin.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: trainer
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: |
+          # setup-python keeps Tcl/Tk next to the interpreter; PyInstaller has to find it on Linux.
+          if [ "$RUNNER_OS" = "Linux" ]; then export LD_LIBRARY_PATH="$pythonLocation/lib"; fi
+          pyinstaller --noconfirm packaging/therealcam_trainer.spec
+      - name: Smoke test of the built CLI (synthetic data, 2 epochs)
+        run: |
+          exe=dist/TheRealCamTrainer/therealcam-trainer
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          "$exe" --version
+          "$exe" synth-dataset "$RUNNER_TEMP/synth" --n 60
+          "$exe" train "$RUNNER_TEMP/synth" -o "$RUNNER_TEMP/m.trcm" --epochs 2 --allow-small --device cpu
+          "$exe" inspect-model "$RUNNER_TEMP/m.trcm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TheRealCamTrainer-${{ runner.os }}
+          path: trainer/dist/TheRealCamTrainer/

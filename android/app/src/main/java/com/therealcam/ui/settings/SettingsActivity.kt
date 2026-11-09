@@ -30,6 +30,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -59,6 +60,8 @@ import androidx.compose.ui.unit.sp
 import com.therealcam.BuildConfig
 import com.therealcam.dataset.MIN_DATASET_SAMPLES
 import com.therealcam.ui.common.CategoriesScreen
+import com.therealcam.ui.common.DatasetConsentDialog
+import com.therealcam.ui.common.GuideScreen
 import com.therealcam.ui.common.SceneIcons
 import com.therealcam.ui.theme.RealColors
 import com.therealcam.ui.theme.RealTheme
@@ -72,39 +75,36 @@ class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(SystemBarStyle.dark(AColor.TRANSPARENT), SystemBarStyle.dark(AColor.BLACK))
         super.onCreate(savedInstanceState)
+        // Opened from the camera's "?" button: show the guide, and Back returns to the camera.
+        val guideOnly = intent.getBooleanExtra(EXTRA_GUIDE, false)
         setContent {
             RealTheme {
                 var categories by remember { mutableStateOf(false) }
-                if (categories) {
-                    BackHandler { categories = false }
-                    val list by vm.categories.collectAsState()
-                    CategoriesScreen(list, { categories = false }, { n, i -> vm.createCategory(n, i) }, { vm.updateCategory(it) }, { vm.deleteCategory(it) })
-                } else {
-                    SettingsScreen(vm, onBack = { finish() }, onCategories = { categories = true })
+                var guide by remember { mutableStateOf(guideOnly) }
+                when {
+                    guide -> {
+                        val close = { if (guideOnly) finish() else guide = false }
+                        BackHandler { close() }
+                        GuideScreen(onBack = close)
+                    }
+                    categories -> {
+                        BackHandler { categories = false }
+                        val list by vm.categories.collectAsState()
+                        CategoriesScreen(list, { categories = false }, { n, i -> vm.createCategory(n, i) }, { vm.updateCategory(it) }, { vm.deleteCategory(it) })
+                    }
+                    else -> SettingsScreen(vm, onBack = { finish() }, onCategories = { categories = true }, onGuide = { guide = true })
                 }
             }
         }
     }
+
+    companion object {
+        const val EXTRA_GUIDE = "guide"
+    }
 }
 
-/** Shown before dataset collection is enabled: lists everything that is recorded. */
-const val CONSENT_TEXT = """В режиме сбора датасета для каждого снимка сохраняется:
-
-• геометка (если разрешена геопозиция);
-• положение телефона: наклон, крен, азимут;
-• гироскоп и акселерометр за 1,5 с до кадра, во время выдержки и 0,75 с после;
-• параметры кадра: выдержка, ISO, диафрагма, фокус, баланс белого, режимы автоматики;
-• то, что вы выставили вручную (или выбрал ИИ), число кадров серии, способ сведения;
-• освещённость, давление, температура батареи, высота Солнца и Луны, фаза Луны, время;
-• маленькое превью сцены и числовые признаки, которые видит модель;
-• ваша оценка 1–10, оценка по критериям и категория.
-
-Всё хранится только на телефоне, в папке приложения (Android/data/com.therealcam/files/TheRealCam). У приложения нет доступа к интернету, поэтому данные никуда не отправляются. Наружу они попадают только при экспорте ZIP, который делаете вы.
-
-В обучение идут только снимки, оценённые по всем критериям. Минимум для обучения — 150 снимков."""
-
 @Composable
-private fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, onCategories: () -> Unit) {
+private fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, onCategories: () -> Unit, onGuide: () -> Unit) {
     val s by vm.settings.collectAsState()
     val models by vm.models.collectAsState()
     val modelError by vm.modelError.collectAsState()
@@ -112,7 +112,10 @@ private fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, onCategori
     val pendingCount by vm.pendingCount.collectAsState()
     val status by vm.status.collectAsState()
     val busy by vm.busy.collectAsState()
+    val lenses by vm.lenses.collectAsState()
+    val rootLog by vm.rootLog.collectAsState()
     var consent by remember { mutableStateOf(false) }
+    var rootConfirm by remember { mutableStateOf(false) }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(vm::importModel) }
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri -> uri?.let(vm::exportDataset) }
@@ -131,6 +134,18 @@ private fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, onCategori
             Text(it, color = Color.Black, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().background(RealColors.Accent).padding(12.dp))
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).navigationBarsPadding().padding(bottom = 24.dp)) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).clip(RoundedCornerShape(14.dp))
+                    .background(RealColors.Surface).clickable(onClick = onGuide).padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.AutoMirrored.Filled.MenuBook, null, tint = RealColors.Accent)
+                Spacer(Modifier.size(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Руководство", color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text("Что делает каждая кнопка и режим — по пунктам", color = RealColors.TextDim, fontSize = 12.sp)
+                }
+            }
             Section("Датасет")
             SwitchRow("Сбор датасета", "Запоминать параметры, датчики и оценки снимков для обучения своей модели", s.datasetMode) { on ->
                 if (on) consent = true else vm.setDatasetMode(false)
@@ -204,7 +219,48 @@ private fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, onCategori
             SwitchRow("Сетка", null, s.grid, vm::setGrid)
             SwitchRow("Уровень горизонта", null, s.level, vm::setLevel)
             SwitchRow("Спуск кнопками громкости", null, s.volumeShutter, vm::setVolumeShutter)
+            SwitchRow(
+                "Голос во время длинной съёмки",
+                "Каждые 30 с говорит, сколько осталось (астро и серии от 30 с). Нужен русский голос в системном синтезаторе речи",
+                s.voice, vm::setVoice,
+            )
             ChoiceRow("Качество JPEG", listOf(90 to "90", 95 to "95", 100 to "100"), s.jpegQuality, vm::setJpegQuality)
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Text("Объективы этого телефона", color = Color.White)
+                if (lenses.isEmpty()) Text("Определяю…", color = RealColors.TextDim, fontSize = 12.sp)
+                lenses.forEach { Text("• $it", color = RealColors.TextDim, fontSize = 12.sp) }
+                Text(
+                    "Переключаются кнопками над спуском и жестом двумя пальцами. Многие Xiaomi/Redmi/POCO показывают " +
+                        "сторонним приложениям только основную камеру; остальные модули приложение ищет само. Если модуль " +
+                        "не открывается, он пропадёт из кнопок после первой попытки.",
+                    color = RealColors.TextDim, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+
+            Section("Про-режим")
+            SwitchRow("Про-режим", "Дополнительные настройки обработки кадра и доступ к камерам через root", s.proMode, vm::setProMode)
+            if (s.proMode) {
+                val modes = listOf(-1 to "Авто", 0 to "Выкл", 1 to "Быстро", 2 to "Макс")
+                ChoiceRow("Шумоподавление", modes, s.noiseReduction, vm::setNoiseReduction)
+                Text(
+                    "Для серий лучше «Выкл»: шум и так уходит при сведении, а детали остаются.",
+                    color = RealColors.TextDim, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp),
+                )
+                ChoiceRow("Резкость", modes, s.edgeMode, vm::setEdgeMode)
+                ChoiceRow("Оптический стабилизатор", listOf(-1 to "Авто", 0 to "Выкл", 1 to "Вкл"), s.oisMode, vm::setOisMode)
+                Text(
+                    "На штативе стабилизатор лучше выключить: при длинной выдержке он может «плыть».",
+                    color = RealColors.TextDim, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp),
+                )
+                SwitchRow(
+                    "Root-доступ к камерам",
+                    "Нужен Magisk или KernelSU. Приложение добавит себя в список программ, которым прошивка " +
+                        "открывает все модули камеры (ультраширик, макро). Действует до перезагрузки, " +
+                        "при запуске приложение повторяет это само.",
+                    s.rootCamera,
+                ) { on -> if (on) rootConfirm = true else vm.setRootCamera(false) }
+                rootLog?.let { Text(it, color = RealColors.TextDim, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 16.dp)) }
+            }
 
             Section("О приложении")
             Text(
@@ -216,12 +272,23 @@ private fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, onCategori
     }
 
     if (consent) {
+        DatasetConsentDialog(onAccept = { consent = false; vm.setDatasetMode(true) }, onDismiss = { consent = false })
+    }
+    if (rootConfirm) {
         AlertDialog(
-            onDismissRequest = { consent = false },
-            title = { Text("Сбор датасета") },
-            text = { Text(CONSENT_TEXT, fontSize = 13.sp, modifier = Modifier.verticalScroll(rememberScrollState())) },
-            confirmButton = { TextButton(onClick = { consent = false; vm.setDatasetMode(true) }) { Text("Включить") } },
-            dismissButton = { TextButton(onClick = { consent = false }) { Text("Отмена") } },
+            onDismissRequest = { rootConfirm = false },
+            title = { Text("Root-доступ к камерам") },
+            text = {
+                Text(
+                    "Приложение запросит su и выполнит только одно: добавит com.therealcam в системные списки " +
+                        "vendor.camera.aux.packagelist (и privapp.list, если они есть). Другие приложения и файлы " +
+                        "не затрагиваются, изменение пропадает после перезагрузки. Выключение переключателя убирает " +
+                        "приложение из списков.",
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = { TextButton(onClick = { rootConfirm = false; vm.setRootCamera(true) }) { Text("Разрешить") } },
+            dismissButton = { TextButton(onClick = { rootConfirm = false }) { Text("Отмена") } },
         )
     }
 }

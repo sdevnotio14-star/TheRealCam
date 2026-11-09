@@ -51,6 +51,7 @@ android {
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.isIncludeAndroidResources = true
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -83,6 +84,23 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
 
     testImplementation(libs.junit)
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(libs.androidx.compose.ui.test.junit4)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.roborazzi)
+    testImplementation(libs.roborazzi.compose)
+}
+
+// UI screenshots (Robolectric + Roborazzi) are rendered only on request:
+//   ./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*ScreenshotTest'   → app/build/screenshots/
+tasks.withType<Test>().configureEach {
+    if (project.hasProperty("screenshots")) {
+        systemProperty("roborazzi.test.record", "true")
+    } else {
+        filter.excludeTestsMatching("*ScreenshotTest")
+        filter.isFailOnNoMatchingTests = false
+    }
 }

@@ -1,19 +1,24 @@
 package com.therealcam.ui.settings
 
 import android.app.Application
+import android.hardware.camera2.CameraManager
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.therealcam.ai.ModelFileInfo
 import com.therealcam.appGraph
+import com.therealcam.camera.LensProbe
+import com.therealcam.core.RootCamera
 import com.therealcam.data.AppSettings
 import com.therealcam.data.db.CategoryEntity
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class SettingsViewModel(app: Application) : AndroidViewModel(app) {
@@ -30,9 +35,23 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     val status = _status.asStateFlow()
     private val _busy = MutableStateFlow(false)
     val busy = _busy.asStateFlow()
+    private val _lenses = MutableStateFlow<List<String>>(emptyList())
+    /** Detected lenses of both sides, e.g. "0.6× Ультраширик · 13 мм · 12 МП". */
+    val lenses = _lenses.asStateFlow()
 
     init {
         viewModelScope.launch { g.models.refresh() }
+        viewModelScope.launch {
+            val manager = app.getSystemService(CameraManager::class.java)
+            _lenses.value = withContext(Dispatchers.IO) {
+                runCatching {
+                    val specs = LensProbe.read(manager)
+                    val all = specs.lenses(front = false) + specs.lenses(front = true)
+                    all.map { l -> l.description + if (l.hidden) " · скрытый модуль, id ${l.cameraId}" else "" } +
+                        "Камер в списке системы: ${specs.listed.size}, найдено скрытых модулей: ${specs.hidden.size}"
+                }.getOrElse { listOf("Не удалось прочитать камеры: ${it.message}") }
+            }
+        }
     }
 
     fun clearStatus() {
@@ -46,6 +65,33 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     fun setGrid(on: Boolean) = viewModelScope.launch { g.settings.setGrid(on) }
     fun setLevel(on: Boolean) = viewModelScope.launch { g.settings.setLevel(on) }
     fun setVolumeShutter(on: Boolean) = viewModelScope.launch { g.settings.setVolumeShutter(on) }
+    fun setVoice(on: Boolean) = viewModelScope.launch { g.settings.setVoice(on) }
+    fun setProMode(on: Boolean) = viewModelScope.launch { g.settings.setProMode(on) }
+    fun setNoiseReduction(v: Int) = viewModelScope.launch { g.settings.setNoiseReduction(v) }
+    fun setEdgeMode(v: Int) = viewModelScope.launch { g.settings.setEdgeMode(v) }
+    fun setOisMode(v: Int) = viewModelScope.launch { g.settings.setOisMode(v) }
+
+    private val _rootLog = MutableStateFlow<String?>(null)
+    /** Output of the last root script, shown under the switch. */
+    val rootLog = _rootLog.asStateFlow()
+
+    /** Root switch: the setting is kept on only when su was granted and the vendor list now contains the app. */
+    fun setRootCamera(on: Boolean) = viewModelScope.launch {
+        _busy.value = true
+        val pkg = getApplication<Application>().packageName
+        val r = withContext(Dispatchers.IO) { if (on) RootCamera.enable(pkg) else RootCamera.disable(pkg) }
+        if (on) {
+            val ok = RootCamera.applied(r, pkg)
+            g.settings.setRootCamera(ok)
+            _status.value = if (ok) "Root: все модули камеры открыты для TheRealCam. Вернитесь в камеру"
+            else "Root не сработал: нет доступа su или прошивка не использует этот список"
+        } else {
+            g.settings.setRootCamera(false)
+            _status.value = "Root-доступ к камерам выключен"
+        }
+        _rootLog.value = r.output.ifBlank { null }
+        _busy.value = false
+    }
     fun setJpegQuality(q: Int) = viewModelScope.launch { g.settings.setJpegQuality(q) }
     fun setDatasetImageMaxSide(px: Int) = viewModelScope.launch { g.settings.setDatasetImageMaxSide(px) }
 

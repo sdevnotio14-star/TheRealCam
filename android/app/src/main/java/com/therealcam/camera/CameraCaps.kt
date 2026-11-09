@@ -6,6 +6,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.os.Build
 import android.util.Range
 import android.util.Rational
 import android.util.Size
@@ -41,6 +42,11 @@ data class CameraCaps(
     val jpegMinFrameNs: Long,
     val timestampRealtime: Boolean,
     val noiseReductionModes: IntArray,
+    /** CONTROL_ZOOM_RATIO_RANGE (API 30+); null means zoom by SCALER_CROP_REGION. */
+    val zoomRatioRange: Range<Float>?,
+    val maxDigitalZoom: Float,
+    val edgeModes: IntArray = IntArray(0),
+    val oisModes: IntArray = IntArray(0),
 ) {
     val isFront get() = facing == CameraMetadata.LENS_FACING_FRONT
     val canManualFocus get() = manualSensor && minFocusDistance > 0f
@@ -103,6 +109,10 @@ data class CameraCaps(
                 timestampRealtime = c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
                     CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
                 noiseReductionModes = c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0),
+                zoomRatioRange = if (Build.VERSION.SDK_INT >= 30) c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null,
+                maxDigitalZoom = c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f,
+                edgeModes = c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: IntArray(0),
+                oisModes = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0),
             )
         }
 

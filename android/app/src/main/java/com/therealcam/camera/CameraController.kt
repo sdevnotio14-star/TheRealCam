@@ -33,6 +33,7 @@ import kotlinx.coroutines.withTimeout
 import java.io.IOException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -55,6 +56,15 @@ class CameraController(context: Context) {
 
     @Volatile private var shot = ShotSettings()
     @Volatile private var region: MeteringRectangle? = null
+    /** CONTROL_ZOOM_RATIO on API 30+ cameras that support it, otherwise a centred crop factor. */
+    @Volatile private var zoomRatio = 1f
+    /** Set while the session is the VIDEO one (preview + recorder surface, no JPEG reader). */
+    @Volatile private var video: VideoOutput? = null
+
+    /** Pro-mode overrides of the camera's processing; -1 keeps the camera default. */
+    data class ProOptions(val noiseReduction: Int = -1, val edge: Int = -1, val ois: Int = -1)
+
+    @Volatile var pro = ProOptions()
 
     private val _caps = MutableStateFlow<CameraCaps?>(null)
     /** Non-null while a session is running. */
@@ -107,10 +117,46 @@ class CameraController(context: Context) {
         }
     }
 
+    /** VIDEO session: preview with the video aspect plus the recorder's persistent surface. */
+    suspend fun openVideo(cameraId: String, texture: SurfaceTexture, out: VideoOutput): CameraCaps = lock.withLock {
+        closeLocked()
+        _error.value = null
+        val c = CameraCaps.read(manager, cameraId)
+        texture.setDefaultBufferSize(out.spec.preview.width, out.spec.preview.height)
+        val surface = Surface(texture)
+        try {
+            val d = openDevice(cameraId)
+            device = d
+            previewSurface = surface
+            video = out
+            session = createSession(d, listOf(surface, out.recorder))
+            shot = shot.copy(focus = if (c.canManualFocus) shot.focus else FocusMode.AUTO)
+            region = null
+            _caps.value = c
+            startPreviewLocked(c)
+            c
+        } catch (t: Throwable) {
+            _error.value = t.message ?: t.javaClass.simpleName
+            closeLocked()
+            surface.release()
+            throw t
+        }
+    }
+
+    /** VIDEO: adds or removes the recorder surface in the repeating request; false without a video session. */
+    suspend fun setRecording(on: Boolean): Boolean = lock.withLock {
+        val v = video ?: return@withLock false
+        val c = _caps.value ?: return@withLock false
+        v.recording = on
+        startPreviewLocked(c)
+        true
+    }
+
     suspend fun close() = lock.withLock { closeLocked() }
 
     private fun closeLocked() {
         _caps.value = null
+        video = null
         runCatching { session?.close() }
         runCatching { device?.close() }
         runCatching { reader?.close() }
@@ -135,6 +181,20 @@ class CameraController(context: Context) {
         runCatching { startPreviewLocked(c) }.onFailure { Log.w(TAG, "preview update failed", it) }
     }
 
+    /**
+     * Zoom ratio for the preview and the following stills; also used by the next [open].
+     * [applyNow] = false only stores it, for a camera that is about to be reopened.
+     */
+    fun setZoomRatio(r: Float, applyNow: Boolean = true) {
+        if (abs(r - zoomRatio) < 1e-3f) return
+        zoomRatio = r
+        // A tap region refers to the old field of view; go back to continuous focus.
+        region = null
+        if (!applyNow) return
+        val c = _caps.value ?: return
+        runCatching { startPreviewLocked(c) }.onFailure { Log.w(TAG, "zoom update failed", it) }
+    }
+
     /** Tap to focus/meter at normalized view coordinates of the (portrait, un-cropped) preview. */
     fun focusAt(u: Float, v: Float) {
         val c = _caps.value ?: return
@@ -142,9 +202,12 @@ class CameraController(context: Context) {
         val s = session ?: return
         if (c.maxAfRegions == 0 && c.maxAeRegions == 0) return
         val (sx, sy) = viewToSensor(u, v, c.sensorOrientation, c.isFront)
-        val half = (min(aa.width(), aa.height()) * 0.07f).roundToInt()
-        val cx = (sx * aa.width()).roundToInt()
-        val cy = (sy * aa.height()).roundToInt()
+        // With CONTROL_ZOOM_RATIO regions are relative to the zoomed view; with a crop they are not.
+        val crop = legacyCrop(c)
+        val f = crop?.let { it.width().toFloat() / aa.width() } ?: 1f
+        val half = (min(aa.width(), aa.height()) * 0.07f * f).roundToInt().coerceAtLeast(1)
+        val cx = (crop?.left ?: 0) + (sx * aa.width() * f).roundToInt()
+        val cy = (crop?.top ?: 0) + (sy * aa.height() * f).roundToInt()
         val rect = Rect(
             (cx - half).coerceIn(0, aa.width() - 1), (cy - half).coerceIn(0, aa.height() - 1),
             (cx + half).coerceIn(1, aa.width()), (cy + half).coerceIn(1, aa.height()),
@@ -217,9 +280,11 @@ class CameraController(context: Context) {
 
     private fun previewBuilder(c: CameraCaps): CaptureRequest.Builder {
         val d = device ?: throw IOException("no device")
-        val b = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+        val v = video
+        val b = d.createCaptureRequest(if (v != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
         b.addTarget(previewSurface ?: throw IOException("no surface"))
         apply3A(b, shot, c, preview = true)
+        v?.applyTo(b, c)
         return b
     }
 
@@ -239,6 +304,7 @@ class CameraController(context: Context) {
                 afState = result.get(CaptureResult.CONTROL_AF_STATE),
                 timestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L,
                 zoomRatio = if (Build.VERSION.SDK_INT >= 30) result.get(CaptureResult.CONTROL_ZOOM_RATIO) else null,
+                focalLengthMm = result.get(CaptureResult.LENS_FOCAL_LENGTH),
             )
         }
     }
@@ -291,6 +357,35 @@ class CameraController(context: Context) {
         }
         val awb = if (s.wb.awbMode in c.awbModes) s.wb.awbMode else CameraMetadata.CONTROL_AWB_MODE_AUTO
         b.set(CaptureRequest.CONTROL_AWB_MODE, awb)
+        applyZoom(b, c)
+        val p = pro
+        if (!preview) {
+            if (p.noiseReduction >= 0 && p.noiseReduction in c.noiseReductionModes) b.set(CaptureRequest.NOISE_REDUCTION_MODE, p.noiseReduction)
+            if (p.edge >= 0 && p.edge in c.edgeModes) b.set(CaptureRequest.EDGE_MODE, p.edge)
+        }
+        if (p.ois >= 0 && p.ois in c.oisModes) b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, p.ois)
+    }
+
+    private fun applyZoom(b: CaptureRequest.Builder, c: CameraCaps) {
+        val zr = c.zoomRatioRange
+        if (Build.VERSION.SDK_INT >= 30 && zr != null) {
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio.coerceIn(zr.lower, zr.upper))
+        } else {
+            legacyCrop(c)?.let { b.set(CaptureRequest.SCALER_CROP_REGION, it) }
+        }
+    }
+
+    /** Centred crop of the active array for digital zoom without CONTROL_ZOOM_RATIO; null at 1×. */
+    private fun legacyCrop(c: CameraCaps): Rect? {
+        if (Build.VERSION.SDK_INT >= 30 && c.zoomRatioRange != null) return null
+        val aa = c.activeArray ?: return null
+        val f = zoomRatio.coerceIn(1f, max(1f, c.maxDigitalZoom))
+        if (f <= 1.001f) return null
+        val w = (aa.width() / f).roundToInt()
+        val h = (aa.height() / f).roundToInt()
+        val left = (aa.width() - w) / 2
+        val top = (aa.height() - h) / 2
+        return Rect(left, top, left + w, top + h)
     }
 
     private fun evSteps(ev: Float, c: CameraCaps): Int {

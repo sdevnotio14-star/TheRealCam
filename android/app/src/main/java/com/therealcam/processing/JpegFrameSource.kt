@@ -9,10 +9,12 @@ import android.os.Build
 import com.therealcam.processing.core.FrameSource
 import com.therealcam.processing.core.Luma8
 import com.therealcam.processing.core.analysisSampleSize
+import com.therealcam.processing.core.luma8
 import java.io.Closeable
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicReferenceArray
+import kotlin.math.min
 
 /**
  * JPEG frames of a series: downscaled decodes (inSampleSize) for analysis and BitmapRegionDecoder
@@ -29,10 +31,15 @@ internal class JpegFrameSource(private val files: List<File>) : FrameSource, Clo
     private val srgb: ColorSpace = ColorSpace.get(ColorSpace.Named.SRGB)
     private var closed = false
 
-    override fun analysisLuma(position: Int): Luma8? {
+    override fun analysisLuma(position: Int): Luma8? = decodeLuma(position, sampleSize)
+
+    /** One DCT-scaled decode of the whole frame instead of many region reads. */
+    override fun scaledLuma(position: Int, sampleSize: Int): Luma8? = decodeLuma(position, sampleSize.coerceAtLeast(1))
+
+    private fun decodeLuma(position: Int, inSample: Int): Luma8? {
         if (width == 0 || sizes[position] != canonical) return null
         val opts = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
+            inSampleSize = inSample
             inPreferredConfig = Bitmap.Config.ARGB_8888
             inPreferredColorSpace = srgb
         }
@@ -40,9 +47,19 @@ internal class JpegFrameSource(private val files: List<File>) : FrameSource, Clo
         try {
             val w = bmp.width
             val h = bmp.height
-            val px = IntArray(w * h)
-            bmp.getPixels(px, 0, w, 0, 0, w, h)
-            return Luma8.fromArgb(w, h, px)
+            val out = ByteArray(w * h)
+            // Row chunks keep the ARGB copy small for the larger refinement decodes.
+            val rows = (LUMA_CHUNK_PIXELS / w).coerceIn(1, h)
+            val px = IntArray(rows * w)
+            var y = 0
+            while (y < h) {
+                val n = min(rows, h - y)
+                bmp.getPixels(px, 0, w, 0, y, w, n)
+                var o = y * w
+                for (i in 0 until n * w) out[o++] = luma8(px[i]).toByte()
+                y += n
+            }
+            return Luma8(w, h, out)
         } finally {
             bmp.recycle()
         }
@@ -98,5 +115,9 @@ internal class JpegFrameSource(private val files: List<File>) : FrameSource, Clo
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, opts)
         return opts.outWidth to opts.outHeight
+    }
+
+    private companion object {
+        const val LUMA_CHUNK_PIXELS = 1 shl 18
     }
 }

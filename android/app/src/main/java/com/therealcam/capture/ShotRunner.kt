@@ -6,12 +6,14 @@ import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
 import com.therealcam.AppGraph
+import com.therealcam.ai.CapturePlanner
 import com.therealcam.ai.SceneFeatures
 import com.therealcam.ai.ScenePreview
 import com.therealcam.camera.CameraCaps
 import com.therealcam.camera.CameraController
 import com.therealcam.camera.CameraMode
 import com.therealcam.camera.CapturedFrame
+import com.therealcam.camera.LensUse
 import com.therealcam.camera.PreviewSnapshot
 import com.therealcam.camera.ShotSettings
 import com.therealcam.camera.StillRequest
@@ -52,6 +54,9 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
         val categoryId: String?,
         val ai: AiInfo?,
         val timerS: Int,
+        val lens: LensUse? = null,
+        /** ScenePreset key in the СЦЕНЫ mode. */
+        val preset: String? = null,
     )
 
     data class Env(
@@ -65,7 +70,8 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
     )
 
     sealed interface Progress {
-        data class Capturing(val frame: Int, val total: Int, val exposureNs: Long?) : Progress
+        /** [endEstimateRt] is the expected end of capturing in elapsedRealtime milliseconds. */
+        data class Capturing(val frame: Int, val total: Int, val exposureNs: Long?, val endEstimateRt: Long? = null) : Progress
         data class Merging(val fraction: Float) : Progress
         data object Saving : Progress
     }
@@ -75,9 +81,12 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
         val id: String,
         val timeMs: Long,
         val file: File,
+        /** Metadata and exposure window only; the JPEG is in [file]. */
         val frame: CapturedFrame,
         val settings: ShotSettings,
         val motion: MetaBuilder.ExposureMotion,
+        val width: Int,
+        val height: Int,
     )
 
     /** [stop] is polled between frames of a series: when true the frames taken so far are merged. */
@@ -91,7 +100,7 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
         val frames = plan.settings.frames.coerceAtLeast(1)
 
         if (frames == 1) {
-            onProgress(Progress.Capturing(1, 1, plan.settings.exposureNs))
+            onProgress(Progress.Capturing(1, 1, plan.settings.exposureNs, SystemClock.elapsedRealtime() + plannedFrameMs(plan.settings)))
             val f = camera.capture(request)
             onProgress(Progress.Saving)
             val uri = g.photos.save(f.jpeg, "$baseName.jpg", env.app.saveToGallery)
@@ -116,16 +125,33 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
         val dir = g.paths.seriesDir(seriesId).apply { mkdirs() }
         val records = ArrayList<FrameRecord>(frames)
         var settings = plan.settings
+        // Automatic series only (AI, scenes and astro): leading frames meter the scene and exposure/ISO of the
+        // rest are corrected. Manual settings are the user's choice and are never changed.
+        val auto = plan.mode == CameraMode.AI || plan.mode == CameraMode.ASTRO || plan.mode == CameraMode.PRESET
+        val meterBudget = if (auto && plan.settings.manualExposure) SeriesMeter.meteringBudget(frames) else 0
+        var metered = 0
+        val seriesStart = SystemClock.elapsedRealtime()
         for (i in 0 until frames) {
             if (i > 0 && stop()) break
-            onProgress(Progress.Capturing(i + 1, frames, settings.exposureNs))
+            val now = SystemClock.elapsedRealtime()
+            val perFrameMs = if (i == 0) plannedFrameMs(settings) else (now - seriesStart) / i
+            onProgress(Progress.Capturing(i + 1, frames, settings.exposureNs, now + (frames - i) * perFrameMs))
             val frameTime = System.currentTimeMillis()
             val f = camera.capture(request.copy(settings = settings))
             val file = File(dir, "frame_%02d.jpg".format(i))
             file.writeBytes(f.jpeg)
             val m = MetaBuilder.exposureMotion(g.sensors, f.exposureStartRt, f.exposureEndRt, env.caps.focalLengthPx)
-            records += FrameRecord(i, Ids.newSampleId(frameTime), frameTime, file, f, settings, m)
-            if (i == 0 && frames >= 3) settings = adaptAfterFirstFrame(settings, plan.profile, file, env.caps)
+            val (fw, fh) = ImageIo.jpegSize(f.jpeg)
+            // Only metadata stays in memory: a long astro series has 100+ frames, too many JPEGs for the heap.
+            val slim = CapturedFrame(ByteArray(0), f.meta, f.exposureStartRt, f.exposureEndRt)
+            records += FrameRecord(i, Ids.newSampleId(frameTime), frameTime, file, slim, settings, m, fw, fh)
+            if (i == metered && metered < meterBudget) {
+                val next = meterNext(settings, plan.profile, file, m, env)
+                if (next == null) metered = meterBudget else {
+                    settings = next
+                    metered++
+                }
+            }
         }
 
         val captured = records.size
@@ -139,6 +165,7 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
                 align = plan.profile.align,
                 rejectOutlierFrames = plan.profile.rejectOutlierFrames,
                 jpegQuality = env.app.jpegQuality,
+                localAlign = plan.profile == Profile.ASTRO,
             ),
             output = resultFile,
             onProgress = { onProgress(Progress.Merging(it)) },
@@ -162,9 +189,8 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
 
         val ds = env.app.datasetMode
         for (r in records) {
-            val (w, h) = ImageIo.jpegSize(r.frame.jpeg)
             g.captures.insert(
-                entity(r.id, r.timeMs, Roles.FRAME, seriesId, r.index, captured, plan, Uri.fromFile(r.file), w, h, orientation, r.frame, location, ds),
+                entity(r.id, r.timeMs, Roles.FRAME, seriesId, r.index, captured, plan, Uri.fromFile(r.file), r.width, r.height, orientation, r.frame, location, ds),
             )
         }
         val last = records.last()
@@ -174,12 +200,11 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
 
         if (ds) g.scope.launch {
             for (r in records) {
-                val (w, h) = ImageIo.jpegSize(r.frame.jpeg)
                 writeSample(
                     id = r.id, timeMs = r.timeMs, plan = plan.copy(settings = r.settings), env = env, frame = r.frame,
                     photoRole = Roles.FRAME, fileName = r.file.name,
                     series = SeriesInfo(seriesId, "frame", r.index, captured, plan.profile.key, plan.settings.stackMode.key),
-                    width = w, height = h, orientation = orientation, location = location, image = { r.file.inputStream() },
+                    width = r.width, height = r.height, orientation = orientation, location = location, image = { r.file.inputStream() },
                 )
             }
             writeSample(
@@ -194,26 +219,41 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
         return result
     }
 
-    /** Frame 0 of a sky/moon series meters the highlights; the remaining frames use the corrected exposure. */
-    private fun adaptAfterFirstFrame(s: ShotSettings, profile: Profile, file: File, caps: CameraCaps): ShotSettings {
-        if (!s.manualExposure || (profile != Profile.LUNAR && profile != Profile.SKY)) return s
-        val bmp = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = 8 }) ?: return s
+    /** Expected wall time of one frame: exposure plus readout and JPEG encoding. */
+    companion object {
+        fun plannedFrameMs(s: ShotSettings): Long {
+            val expMs = (s.exposureNs ?: 50_000_000L) / 1_000_000L
+            return expMs + max(150L, expMs * 3 / 100)
+        }
+    }
+
+    /** Settings for the frames after a metering frame, or null to keep them (see [SeriesMeter]). */
+    private fun meterNext(s: ShotSettings, profile: Profile, file: File, motion: MetaBuilder.ExposureMotion, env: Env): ShotSettings? {
+        val exp = s.exposureNs ?: return null
+        val iso = s.iso ?: return null
+        val bmp = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = 8 }) ?: return null
         val px = ImageIo.toArgb(bmp)
+        val w = bmp.width
+        val h = bmp.height
         bmp.recycle()
-        var clipped = 0
-        var bright = 0
-        for (p in px) {
-            val l = SceneFeatures.luma(p)
-            if (l >= 0.98f) clipped++
-            if (l >= 0.45f) bright++
-        }
-        val exp = s.exposureNs!!
-        val range = caps.exposureRange
-        return when {
-            clipped > px.size * 0.002 -> s.copy(exposureNs = max(exp / 2, range?.lower ?: 1L))
-            profile == Profile.LUNAR && bright == 0 -> s.copy(exposureNs = min(exp * 2, range?.upper ?: exp * 2))
-            else -> s
-        }
+        val luma = FloatArray(px.size) { SceneFeatures.luma(px[it]) }
+        val k = SeriesMeter.correction(profile, SeriesMeter.stats(luma, w, h))
+        val er = env.caps.exposureRange
+        val ir = env.caps.isoRange
+        val handheldNs = (CapturePlanner.HANDHELD_MAX_S * 1e9).toLong()
+        val lim = SeriesMeter.Limits(
+            minExpNs = er?.lower ?: exp,
+            maxExpNs = er?.upper ?: exp,
+            brightenMaxExpNs = when {
+                profile == Profile.LUNAR -> exp
+                env.motion.steady -> er?.upper ?: exp
+                else -> max(exp, handheldNs)
+            },
+            minIso = ir?.lower ?: iso,
+            maxIso = ir?.upper ?: iso,
+        )
+        val (e, i) = SeriesMeter.apply(exp, iso, k, motion.blurPx, profile, lim, motion.rms) ?: return null
+        return s.copy(exposureNs = e, iso = i)
     }
 
     private fun entity(
@@ -242,7 +282,7 @@ class ShotRunner(private val g: AppGraph, private val camera: CameraController) 
                 mode = plan.mode.key,
                 photo = PhotoInfo(photoRole, width, height, orientation, env.app.jpegQuality, fileName),
                 capture = MetaBuilder.capture(frame.meta),
-                userSettings = MetaBuilder.userSettings(plan.settings, plan.timerS, plan.categoryId),
+                userSettings = MetaBuilder.userSettings(plan.settings, plan.timerS, plan.categoryId, plan.lens, plan.preset),
                 series = series,
                 location = MetaBuilder.location(location),
                 orientation = MetaBuilder.orientation(env.motion),

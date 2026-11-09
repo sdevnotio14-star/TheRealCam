@@ -10,6 +10,7 @@ import android.os.SystemClock
 import com.therealcam.BuildConfig
 import com.therealcam.camera.CameraCaps
 import com.therealcam.camera.FrameMetadata
+import com.therealcam.camera.LensUse
 import com.therealcam.camera.PreviewSnapshot
 import com.therealcam.camera.ShotSettings
 import com.therealcam.camera.FocusMode
@@ -65,7 +66,7 @@ object MetaBuilder {
         sensorTimestampNs = m.sensorTimestampNs,
     )
 
-    fun userSettings(s: ShotSettings, timerS: Int, categoryHint: String?) = UserSettingsInfo(
+    fun userSettings(s: ShotSettings, timerS: Int, categoryHint: String?, lens: LensUse? = null, preset: String? = null) = UserSettingsInfo(
         iso = s.iso, exposureTimeNs = s.exposureNs, focus = s.focus.key,
         focusDistanceDiopters = when (s.focus) {
             FocusMode.INFINITY -> 0f
@@ -73,6 +74,7 @@ object MetaBuilder {
             FocusMode.AUTO -> null
         },
         wb = s.wb.key, ev = s.ev, frames = s.frames, stackMode = s.stackMode.key, timerS = timerS, categoryHint = categoryHint,
+        lens = lens?.kind?.key, zoom = lens?.zoom, equivFocalMm = lens?.equivMm, preset = preset,
     )
 
     fun location(l: Location?): LocationInfo? = l?.let {

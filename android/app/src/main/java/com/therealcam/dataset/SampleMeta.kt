@@ -99,6 +99,14 @@ data class UserSettingsInfo(
     val stackMode: String,
     val timerS: Int,
     val categoryHint: String?,
+    /** ultrawide / main / tele / macro / front. */
+    val lens: String? = null,
+    /** Field of view relative to the main lens of that side: 0.6, 1, 2.5… */
+    val zoom: Float? = null,
+    /** 35 mm equivalent focal length at that zoom. */
+    val equivFocalMm: Float? = null,
+    /** Scene of the СЦЕНЫ mode: night, clouds, sunset, moon, trails, water, action, document. */
+    val preset: String? = null,
 )
 
 @Serializable

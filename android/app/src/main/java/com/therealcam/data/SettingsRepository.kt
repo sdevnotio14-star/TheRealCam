@@ -31,6 +31,30 @@ data class AppSettings(
     val activeModel: String? = null,
     val lastMode: String = "auto",
     val lastCategoryHint: String? = null,
+    /** VIDEO mode: VideoQuality key, frame rate and stabilization wish (applied when the camera supports it). */
+    val videoQuality: String = "1080p",
+    val videoFps: Int = 30,
+    val videoStabilization: Boolean = true,
+    /** The first-run screen (own dataset or a shared model) was completed or skipped. */
+    val onboarded: Boolean = false,
+    /** Astro mode: total shooting time of one picture. */
+    val astroDurationS: Int = 240,
+    /** Voice countdown of long series every 30 s. */
+    val voice: Boolean = true,
+    /** Last scene of the СЦЕНЫ mode (ScenePreset key). */
+    val lastPreset: String = "night",
+    /** Pro mode: shows the options below in settings and applies them. */
+    val proMode: Boolean = false,
+    /** Root: add the app to the vendor list of packages that see all camera modules. */
+    val rootCamera: Boolean = false,
+    /** Camera2 NOISE_REDUCTION_MODE for stills, -1 = camera default. */
+    val noiseReduction: Int = -1,
+    /** Camera2 EDGE_MODE (sharpening) for stills, -1 = camera default. */
+    val edgeMode: Int = -1,
+    /** Camera2 LENS_OPTICAL_STABILIZATION_MODE, -1 = camera default. */
+    val oisMode: Int = -1,
+    /** Manual setups saved by the user (СЦЕНЫ mode). */
+    val userPresets: List<UserPreset> = emptyList(),
 )
 
 class SettingsRepository(private val context: Context) {
@@ -49,6 +73,19 @@ class SettingsRepository(private val context: Context) {
         val activeModel = stringPreferencesKey("active_model")
         val lastMode = stringPreferencesKey("last_mode")
         val lastCategoryHint = stringPreferencesKey("last_category_hint")
+        val videoQuality = stringPreferencesKey("video_quality")
+        val videoFps = intPreferencesKey("video_fps")
+        val videoStabilization = booleanPreferencesKey("video_stabilization")
+        val onboarded = booleanPreferencesKey("onboarded")
+        val astroDurationS = intPreferencesKey("astro_duration_s")
+        val voice = booleanPreferencesKey("voice")
+        val lastPreset = stringPreferencesKey("last_preset")
+        val proMode = booleanPreferencesKey("pro_mode")
+        val rootCamera = booleanPreferencesKey("root_camera")
+        val noiseReduction = intPreferencesKey("noise_reduction")
+        val edgeMode = intPreferencesKey("edge_mode")
+        val oisMode = intPreferencesKey("ois_mode")
+        val userPresets = stringPreferencesKey("user_presets")
     }
 
     val settings: Flow<AppSettings> = context.dataStore.data.map { it.toSettings() }
@@ -72,6 +109,19 @@ class SettingsRepository(private val context: Context) {
             activeModel = this[K.activeModel],
             lastMode = this[K.lastMode] ?: d.lastMode,
             lastCategoryHint = this[K.lastCategoryHint],
+            videoQuality = this[K.videoQuality] ?: d.videoQuality,
+            videoFps = this[K.videoFps] ?: d.videoFps,
+            videoStabilization = this[K.videoStabilization] ?: d.videoStabilization,
+            onboarded = this[K.onboarded] ?: d.onboarded,
+            astroDurationS = this[K.astroDurationS] ?: d.astroDurationS,
+            voice = this[K.voice] ?: d.voice,
+            lastPreset = this[K.lastPreset] ?: d.lastPreset,
+            proMode = this[K.proMode] ?: d.proMode,
+            rootCamera = this[K.rootCamera] ?: d.rootCamera,
+            noiseReduction = this[K.noiseReduction] ?: d.noiseReduction,
+            edgeMode = this[K.edgeMode] ?: d.edgeMode,
+            oisMode = this[K.oisMode] ?: d.oisMode,
+            userPresets = UserPresets.decode(this[K.userPresets]),
         )
     }
 
@@ -89,7 +139,29 @@ class SettingsRepository(private val context: Context) {
     suspend fun setLevel(v: Boolean) = context.dataStore.edit { it[K.level] = v }
     suspend fun setVolumeShutter(v: Boolean) = context.dataStore.edit { it[K.volumeShutter] = v }
     suspend fun setTimerSeconds(v: Int) = context.dataStore.edit { it[K.timerSeconds] = v }
+    suspend fun setVideo(quality: String, fps: Int, stabilization: Boolean) = context.dataStore.edit {
+        it[K.videoQuality] = quality
+        it[K.videoFps] = fps
+        it[K.videoStabilization] = stabilization
+    }
     suspend fun setLastMode(v: String) = context.dataStore.edit { it[K.lastMode] = v }
+    suspend fun setOnboarded(v: Boolean) = context.dataStore.edit { it[K.onboarded] = v }
+    suspend fun setAstroDurationS(v: Int) = context.dataStore.edit { it[K.astroDurationS] = v.coerceIn(10, 3600) }
+    suspend fun setVoice(v: Boolean) = context.dataStore.edit { it[K.voice] = v }
+    suspend fun setLastPreset(v: String) = context.dataStore.edit { it[K.lastPreset] = v }
+    suspend fun setProMode(v: Boolean) = context.dataStore.edit { it[K.proMode] = v }
+    suspend fun setRootCamera(v: Boolean) = context.dataStore.edit { it[K.rootCamera] = v }
+    suspend fun setNoiseReduction(v: Int) = context.dataStore.edit { it[K.noiseReduction] = v }
+    suspend fun setEdgeMode(v: Int) = context.dataStore.edit { it[K.edgeMode] = v }
+    suspend fun setOisMode(v: Int) = context.dataStore.edit { it[K.oisMode] = v }
+
+    suspend fun saveUserPreset(p: UserPreset) = context.dataStore.edit {
+        it[K.userPresets] = UserPresets.encode(UserPresets.decode(it[K.userPresets]).filter { u -> u.id != p.id } + p)
+    }
+
+    suspend fun deleteUserPreset(id: String) = context.dataStore.edit {
+        it[K.userPresets] = UserPresets.encode(UserPresets.decode(it[K.userPresets]).filter { u -> u.id != id })
+    }
 
     suspend fun setActiveModel(fileName: String?) = context.dataStore.edit {
         if (fileName == null) it.remove(K.activeModel) else it[K.activeModel] = fileName

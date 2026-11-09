@@ -203,7 +203,7 @@ private fun shotLine(e: CaptureEntity): String = listOfNotNull(
     e.exposureNs?.let { ExposureScale.formatShutter(it) },
     e.iso?.let { "ISO$it" },
     e.focusDiopters?.let { if (it <= 0.01f) "∞" else "%.2fм".format(1f / it) },
-    when (e.mode) { "manual" -> "ручной"; "ai" -> "AI"; else -> "авто" },
+    when (e.mode) { "manual" -> "ручной"; "ai" -> "AI"; "astro" -> "астро"; "preset" -> "сцена"; else -> "авто" },
 ).joinToString(" · ")
 
 @Composable
@@ -278,7 +278,7 @@ private fun InfoDialog(vm: GalleryViewModel, e: CaptureEntity, onDismiss: () -> 
         e.exposureNs?.let { add("Выдержка" to ExposureScale.formatShutter(it)) }
         e.iso?.let { add("ISO" to "$it") }
         e.focusDiopters?.let { add("Фокус" to if (it <= 0.01f) "∞" else "%.2f м".format(1f / it)) }
-        add("Режим" to when (e.mode) { "manual" -> "Ручной"; "ai" -> "AI"; else -> "Авто" })
+        add("Режим" to when (e.mode) { "manual" -> "Ручной"; "ai" -> "AI"; "astro" -> "Астро"; "preset" -> "Сцена"; else -> "Авто" })
         e.profile?.let { add("Профиль" to Profile.of(it).label) }
         if (e.lat != null && e.lon != null) add("Место" to "%.5f, %.5f".format(e.lat, e.lon))
         meta?.environment?.lux?.let { add("Освещённость" to "%.1f лк".format(it)) }

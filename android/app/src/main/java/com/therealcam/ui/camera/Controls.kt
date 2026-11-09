@@ -1,9 +1,11 @@
 package com.therealcam.ui.camera
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,10 +21,17 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.BookmarkAdd
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -37,7 +46,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.therealcam.ai.AstroPlanner
 import com.therealcam.ai.engine.TrcmModel
+import com.therealcam.capture.PresetPlanner
+import com.therealcam.capture.ScenePreset
+import com.therealcam.data.UserPreset
+import com.therealcam.ui.common.CategoryDialog
 import com.therealcam.camera.CameraCaps
 import com.therealcam.camera.CameraMode
 import com.therealcam.camera.ExposureScale
@@ -65,8 +79,13 @@ fun rotationFor(deviceOrientation: Int): Float {
 
 @Composable
 fun ModeSwitcher(mode: CameraMode, enabled: Boolean, onMode: (CameraMode) -> Unit) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-        CameraMode.entries.forEach { m ->
+    val modes = CameraMode.entries
+    val state = rememberLazyListState()
+    val idx = modes.indexOf(mode)
+    // Keep the selected mode in view: there are more modes than fit on a narrow screen.
+    LaunchedEffect(idx) { if (idx >= 0) state.animateScrollToItem((idx - 1).coerceAtLeast(0)) }
+    LazyRow(state = state, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+        itemsIndexed(modes) { _, m ->
             val sel = m == mode
             Text(
                 m.label,
@@ -76,7 +95,7 @@ fun ModeSwitcher(mode: CameraMode, enabled: Boolean, onMode: (CameraMode) -> Uni
                 modifier = Modifier
                     .clip(RoundedCornerShape(16.dp))
                     .clickable(enabled = enabled) { onMode(m) }
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
             )
         }
     }
@@ -306,5 +325,137 @@ fun AiControls(
             Spacer(Modifier.height(2.dp))
             Text("${p.cls.name} · ${p.label}", color = Color.White, fontSize = 12.sp, maxLines = 1)
         }
+    }
+}
+
+/**
+ * Astro mode: total time of one picture, the plan (frames × exposure · ISO · ∞ · ≈ time),
+ * voice countdown on/off and a tripod hint. Exposure and ISO are chosen automatically.
+ */
+@Composable
+fun AstroControls(
+    plan: AstroPlanner.Plan?,
+    durationS: Int,
+    voice: Boolean,
+    steady: Boolean,
+    onDuration: (Int) -> Unit,
+    onVoice: (Boolean) -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        val selected = AstroPlanner.DURATIONS_S.minBy { kotlin.math.abs(it - durationS) }
+        ValueRow(AstroPlanner.DURATIONS_S, selected, { "${it / 60} мин" }, onDuration)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.AutoAwesome, null, tint = RealColors.Accent, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(plan?.label ?: "Смотрю на небо…", color = Color.White, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f))
+            Box(
+                Modifier.size(34.dp).clip(CircleShape).background(if (voice) RealColors.SurfaceHigh else Color.Transparent)
+                    .clickable { onVoice(!voice) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    if (voice) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                    if (voice) "Голос: сколько осталось — включён" else "Голос выключен",
+                    tint = if (voice) RealColors.Accent else RealColors.TextDim, modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        val hint = when {
+            plan?.sensorLimited == true && plan.frameS != null ->
+                "Сенсор держит не дольше ${ExposureScale.formatShutter((plan.frameS * 1e9).toLong())}: кадров больше, каждый короче"
+            plan?.sensorLimited == true -> "Нет ручной выдержки: много коротких кадров с автоэкспозицией"
+            !steady -> "Поставьте телефон на штатив или опору"
+            else -> "Телефон неподвижен. Фары и самолёты уберутся при сведении"
+        }
+        Text(hint, color = if (!steady) RealColors.Warn else RealColors.TextDim, fontSize = 11.sp, maxLines = 2)
+    }
+}
+
+/** СЦЕНЫ mode: scene buttons with icons (built-in, then the user's own), the plan and what it does. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun PresetControls(
+    preset: ScenePreset,
+    plan: PresetPlanner.Plan?,
+    steady: Boolean,
+    orientation: Float,
+    onPreset: (ScenePreset) -> Unit,
+    userPresets: List<UserPreset> = emptyList(),
+    selectedUser: String? = null,
+    onUser: (String) -> Unit = {},
+    onDeleteUser: (String) -> Unit = {},
+) {
+    var deleting by remember { mutableStateOf<UserPreset?>(null) }
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        val state = rememberLazyListState()
+        val idx = if (selectedUser != null) ScenePreset.entries.size + userPresets.indexOfFirst { it.id == selectedUser }
+        else ScenePreset.entries.indexOf(preset)
+        LaunchedEffect(idx) { if (idx >= 0) state.animateScrollToItem((idx - 2).coerceAtLeast(0)) }
+        LazyRow(state = state, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            itemsIndexed(ScenePreset.entries) { _, p ->
+                PresetButton(p.icon, p.title, selectedUser == null && p == preset, orientation, Modifier.clickable { onPreset(p) })
+            }
+            itemsIndexed(userPresets) { _, u ->
+                PresetButton(
+                    u.icon, u.name, u.id == selectedUser, orientation,
+                    Modifier.combinedClickable(onClick = { onUser(u.id) }, onLongClick = { deleting = u }),
+                    mine = true,
+                )
+            }
+        }
+        Text(plan?.label ?: "Смотрю на сцену…", color = Color.White, fontSize = 12.sp, maxLines = 1)
+        val warn = plan?.needsTripod == true && !steady
+        Text(plan?.hint ?: "", color = if (warn) RealColors.Warn else RealColors.TextDim, fontSize = 11.sp, maxLines = 2)
+    }
+    deleting?.let { u ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("Удалить пресет «${u.name}»?") },
+            confirmButton = { TextButton(onClick = { deleting = null; onDeleteUser(u.id) }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("Отмена") } },
+        )
+    }
+}
+
+@Composable
+private fun PresetButton(icon: String, title: String, sel: Boolean, orientation: Float, click: Modifier, mine: Boolean = false) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.width(62.dp).clip(RoundedCornerShape(10.dp)).then(click).padding(vertical = 2.dp),
+    ) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape).background(if (sel) RealColors.Accent else RealColors.SurfaceHigh)
+                .border(if (mine) 1.dp else 0.dp, if (mine) RealColors.AccentDim else Color.Transparent, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(SceneIcons.of(icon), title, tint = if (sel) Color.Black else Color.White, modifier = Modifier.size(22.dp).rotate(orientation))
+        }
+        Text(title, fontSize = 10.sp, maxLines = 1, color = if (sel) RealColors.Accent else RealColors.TextDim)
+    }
+}
+
+/** Manual mode: saves the current settings as a preset of the СЦЕНЫ mode. */
+@Composable
+fun SavePresetButton(onSave: (name: String, icon: String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    TextButton(onClick = { open = true }) {
+        Icon(Icons.Filled.BookmarkAdd, null, tint = RealColors.Accent, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Сохранить как пресет", color = RealColors.Accent, fontSize = 12.sp)
+    }
+    if (open) {
+        CategoryDialog(
+            title = "Новый пресет",
+            onDismiss = { open = false },
+            onConfirm = { name, icon -> open = false; onSave(name, icon) },
+        )
     }
 }

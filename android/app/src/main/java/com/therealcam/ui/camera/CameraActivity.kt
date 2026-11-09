@@ -12,11 +12,14 @@ import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,21 +27,29 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
 import com.therealcam.ui.gallery.GalleryActivity
+import com.therealcam.ui.onboarding.OnboardingScreen
+import com.therealcam.ui.onboarding.OnboardingViewModel
 import com.therealcam.ui.settings.SettingsActivity
 import com.therealcam.ui.theme.RealTheme
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 class CameraActivity : ComponentActivity() {
     private val vm: CameraViewModel by viewModels()
+    private val onboarding: OnboardingViewModel by viewModels()
     private var hasCamera by mutableStateOf(false)
     private var askedOnce = false
 
@@ -60,17 +71,35 @@ class CameraActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hasCamera = granted(Manifest.permission.CAMERA)
-        requestMissing()
+        // Permissions are asked after the first-run screen, not on top of it.
+        lifecycleScope.launch {
+            onboarding.needed.first { it == false }
+            requestMissing()
+        }
         setContent {
             RealTheme {
-                if (hasCamera) {
-                    CameraScreen(
+                val onboardingNeeded by onboarding.needed.collectAsState()
+                when {
+                    onboardingNeeded == null -> Box(Modifier.fillMaxSize().background(ComposeColor.Black))
+                    onboardingNeeded == true -> {
+                        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                            uri?.let(onboarding::importModel)
+                        }
+                        OnboardingScreen(
+                            importedModel = onboarding.imported.collectAsState().value,
+                            importError = onboarding.error.collectAsState().value,
+                            importBusy = onboarding.busy.collectAsState().value,
+                            onImportModel = { picker.launch(arrayOf("*/*")) },
+                            onFinish = { onboarding.finish(it) },
+                        )
+                    }
+                    hasCamera -> CameraScreen(
                         vm,
                         onGallery = { id -> startActivity(GalleryActivity.intent(this, id)) },
                         onSettings = { startActivity(Intent(this, SettingsActivity::class.java)) },
+                        onGuide = { startActivity(Intent(this, SettingsActivity::class.java).putExtra(SettingsActivity.EXTRA_GUIDE, true)) },
                     )
-                } else {
-                    PermissionScreen()
+                    else -> PermissionScreen()
                 }
             }
         }
@@ -126,7 +155,7 @@ class CameraActivity : ComponentActivity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_CAMERA) &&
-            hasCamera && (vm.settings.value.volumeShutter || keyCode == KeyEvent.KEYCODE_CAMERA)
+            hasCamera && onboarding.needed.value == false && (vm.settings.value.volumeShutter || keyCode == KeyEvent.KEYCODE_CAMERA)
         ) {
             if (event?.repeatCount == 0) vm.onShutter()
             return true

@@ -1,19 +1,19 @@
 package com.therealcam.ui.camera
 
+import android.app.Activity
 import android.graphics.SurfaceTexture
 import android.view.TextureView
+import android.view.WindowManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.FlipCameraAndroid
@@ -54,8 +55,8 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -82,6 +83,7 @@ fun CameraScreen(
     vm: CameraViewModel,
     onGallery: (captureId: String?) -> Unit,
     onSettings: () -> Unit,
+    onGuide: () -> Unit = {},
 ) {
     val settings by vm.settings.collectAsState()
     val mode by vm.mode.collectAsState()
@@ -96,7 +98,12 @@ fun CameraScreen(
     val model by vm.model.collectAsState()
     val ai by vm.ai.collectAsState()
     val torch by vm.torch.collectAsState()
+    val lenses by vm.lenses.collectAsState()
+    val lens by vm.lens.collectAsState()
+    val zoom by vm.zoom.collectAsState()
+    val recording by vm.video.recording.collectAsState()
     val rot = rotationFor(motion.deviceOrientation)
+    DimWhile(busy != null && mode == CameraMode.ASTRO)
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
@@ -105,7 +112,7 @@ fun CameraScreen(
                 Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TopIcon(Icons.Filled.Settings, "Настройки", rot) { onSettings() }
+                TopIcon(Icons.Filled.Settings, "Настройки", rot) { if (!recording) onSettings() }
                 TopIcon(Icons.Filled.Timer, "Таймер", rot, badge = settings.timerSeconds.takeIf { it > 0 }?.let { "${it}с" }) {
                     vm.setTimer(when (settings.timerSeconds) { 0 -> 3; 3 -> 10; else -> 0 })
                 }
@@ -113,6 +120,7 @@ fun CameraScreen(
                 if (caps?.flash == true) {
                     TopIcon(if (torch) Icons.Filled.FlashOn else Icons.Filled.FlashOff, "Фонарик", rot, active = torch) { vm.toggleTorch() }
                 }
+                TopIcon(Icons.AutoMirrored.Filled.HelpOutline, "Руководство", rot) { onGuide() }
                 Spacer(Modifier.weight(1f))
                 if (settings.datasetMode) {
                     Row(
@@ -134,18 +142,32 @@ fun CameraScreen(
             }
 
             // ---------------------------------------------------------------- preview
-            Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f)) {
+            Box(previewArea(mode == CameraMode.VIDEO)) {
                 PreviewView(vm, Modifier.fillMaxSize())
                 if (settings.grid) GridOverlay()
                 if (settings.level) LevelOverlay(motion.rollDeg, motion.pitchDeg, motion.deviceOrientation)
-                FocusTapLayer(enabled = busy == null) { u, v -> vm.focusAt(u, v) }
+                if (mode == CameraMode.MANUAL) {
+                    vm.histogram.collectAsState().value?.let { HistogramOverlay(it, Modifier.align(Alignment.TopStart).padding(10.dp)) }
+                }
+                FocusTapLayer(enabled = busy == null, onTap = { u, v -> vm.focusAt(u, v) }, onPinch = vm::onPinch, onPinchEnd = vm::onPinchEnd)
+                if (busy == null && countdown == null) {
+                    ZoomBar(
+                        lenses, lens, zoom, rot, onLens = vm::selectLens,
+                        modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp),
+                        onZoom = vm::setZoom,
+                    )
+                }
+                if (recording) RecordingBadge(vm.video.elapsedS.collectAsState().value, Modifier.align(Alignment.TopCenter).padding(top = 10.dp))
 
                 val needTripod = when (mode) {
                     CameraMode.AI -> ai?.plan?.needsTripod == true
+                    CameraMode.ASTRO -> true
+                    CameraMode.PRESET -> vm.presetPlan.collectAsState().value?.needsTripod == true
                     CameraMode.MANUAL -> vm.shot.collectAsState().value.let { s ->
                         (s.exposureNs ?: 0L) >= 66_000_000L || (s.frames > 1 && (s.exposureNs ?: 0L) * s.frames >= 1_000_000_000L)
                     }
                     CameraMode.AUTO -> false
+                    CameraMode.VIDEO -> false
                 }
                 if (needTripod) {
                     Box(
@@ -162,7 +184,7 @@ fun CameraScreen(
                     Text("$it", fontSize = 96.sp, fontWeight = FontWeight.Light, color = Color.White,
                         modifier = Modifier.align(Alignment.Center).rotate(rot))
                 }
-                busy?.let { BusyOverlay(it, Modifier.align(Alignment.BottomCenter)) }
+                busy?.let { BusyOverlay(it, vm.remainingS.collectAsState().value, Modifier.align(Alignment.BottomCenter)) }
                 message?.let { m ->
                     LaunchedEffect(m) {
                         delay(3500)
@@ -177,7 +199,7 @@ fun CameraScreen(
             }
 
             // ---------------------------------------------------------------- controls
-            Column(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.SpaceEvenly) {
+            Column(controlsArea(mode == CameraMode.VIDEO), verticalArrangement = Arrangement.SpaceEvenly) {
                 when (mode) {
                     CameraMode.AUTO -> {
                         EvRow(vm.autoEv.collectAsState().value, vm::setAutoEv)
@@ -189,10 +211,21 @@ fun CameraScreen(
                             vm::setIso, vm::setShutter, vm::updateShot, vm::setFrames,
                         )
                         HintRow(vm.categories.collectAsState().value, vm.categoryHint.collectAsState().value, rot, vm::setCategoryHint)
+                        SavePresetButton { name, icon -> vm.saveManualAsPreset(name, icon) }
                     }
+                    CameraMode.PRESET -> PresetControls(
+                        vm.preset.collectAsState().value, vm.presetPlan.collectAsState().value, motion.steady, rot, vm::setPreset,
+                        userPresets = settings.userPresets, selectedUser = vm.userPreset.collectAsState().value,
+                        onUser = vm::setUserPreset, onDeleteUser = { vm.deleteUserPreset(it) },
+                    )
+                    CameraMode.ASTRO -> AstroControls(
+                        vm.astro.collectAsState().value, settings.astroDurationS, settings.voice, motion.steady,
+                        vm::setAstroDuration, { vm.setVoice(it) },
+                    )
                     CameraMode.AI -> AiControls(model, vm.modelError.collectAsState().value, ai, datasetCount, rot, vm::pickAiClass)
+                    CameraMode.VIDEO -> VideoControls(vm.video, rot)
                 }
-                ModeSwitcher(mode, enabled = busy == null, onMode = vm::setMode)
+                ModeSwitcher(mode, enabled = busy == null && !recording, onMode = vm::setMode)
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 28.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -200,14 +233,16 @@ fun CameraScreen(
                 ) {
                     Box(
                         Modifier.size(52.dp).clip(CircleShape).background(RealColors.SurfaceHigh)
-                            .clickable { onGallery(latest?.id) },
+                            .clickable(enabled = !recording) { onGallery(latest?.id) },
                     ) {
                         latest?.let {
                             AsyncImage(model = it.imageUri, contentDescription = "Последний снимок", contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize().rotate(rot))
                         }
                     }
-                    Shutter(busy, countdown != null, onClick = {
+                    if (mode == CameraMode.VIDEO) {
+                        RecordButton(recording, onClick = vm::onShutter)
+                    } else Shutter(busy, countdown != null, onClick = {
                         when {
                             busy != null -> vm.requestStop()
                             countdown != null -> vm.cancelShot()
@@ -216,7 +251,7 @@ fun CameraScreen(
                     })
                     Box(
                         Modifier.size(52.dp).clip(CircleShape).background(RealColors.SurfaceHigh)
-                            .clickable(enabled = busy == null) { vm.switchCamera() },
+                            .clickable(enabled = busy == null && !recording) { vm.switchCamera() },
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(Icons.Filled.FlipCameraAndroid, "Сменить камеру", tint = Color.White, modifier = Modifier.rotate(rot))
@@ -226,6 +261,20 @@ fun CameraScreen(
         }
 
         ratingFor?.let { id -> RatingOverlay(vm, id, onDetails = { onGallery(id) }) }
+    }
+}
+
+/** Dims the screen during long astro captures: saves battery and keeps night vision. */
+@Composable
+private fun DimWhile(dim: Boolean) {
+    val window = (LocalContext.current as? Activity)?.window
+    DisposableEffect(dim, window) {
+        if (dim && window != null) window.attributes = window.attributes.apply { screenBrightness = 0.03f }
+        onDispose {
+            if (dim && window != null) {
+                window.attributes = window.attributes.apply { screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
+            }
+        }
     }
 }
 
@@ -304,7 +353,7 @@ private fun LevelOverlay(rollDeg: Double, pitchDeg: Double, orientation: Int) {
 }
 
 @Composable
-private fun FocusTapLayer(enabled: Boolean, onTap: (Float, Float) -> Unit) {
+private fun FocusTapLayer(enabled: Boolean, onTap: (Float, Float) -> Unit, onPinch: (Float) -> Unit, onPinchEnd: () -> Unit) {
     var tap by remember { mutableStateOf<Offset?>(null) }
     LaunchedEffect(tap) {
         if (tap != null) {
@@ -314,12 +363,15 @@ private fun FocusTapLayer(enabled: Boolean, onTap: (Float, Float) -> Unit) {
     }
     val density = LocalDensity.current
     BoxWithConstraints(
-        Modifier.fillMaxSize().pointerInput(enabled) {
-            if (enabled) detectTapGestures { o ->
+        Modifier.fillMaxSize().previewGestures(
+            enabled,
+            onTap = { o, size ->
                 tap = o
                 onTap(o.x / size.width, o.y / size.height)
-            }
-        },
+            },
+            onPinch = onPinch,
+            onPinchEnd = onPinchEnd,
+        ),
     ) {
         tap?.let { o ->
             val r = with(density) { 32.dp.toPx() }
@@ -332,7 +384,7 @@ private fun FocusTapLayer(enabled: Boolean, onTap: (Float, Float) -> Unit) {
 }
 
 @Composable
-private fun BusyOverlay(p: ShotRunner.Progress, modifier: Modifier) {
+private fun BusyOverlay(p: ShotRunner.Progress, remainingS: Int?, modifier: Modifier) {
     Column(
         modifier.padding(12.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(RealColors.Scrim).padding(10.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -340,7 +392,8 @@ private fun BusyOverlay(p: ShotRunner.Progress, modifier: Modifier) {
         val (text, progress) = when (p) {
             is ShotRunner.Progress.Capturing -> {
                 val exp = p.exposureNs?.let { " · " + ExposureScale.formatShutter(it) } ?: ""
-                (if (p.total > 1) "Кадр ${p.frame} / ${p.total}$exp" else "Съёмка$exp") to
+                val left = remainingS?.let { " · осталось %d:%02d".format(it / 60, it % 60) } ?: ""
+                (if (p.total > 1) "Кадр ${p.frame} / ${p.total}$exp$left" else "Съёмка$exp$left") to
                     (if (p.total > 1) (p.frame - 1f) / p.total else null)
             }
             is ShotRunner.Progress.Merging -> "Сведение кадров ${(p.fraction * 100).roundToInt()}%" to p.fraction

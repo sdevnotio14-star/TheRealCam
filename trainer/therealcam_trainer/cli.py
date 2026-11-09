@@ -255,9 +255,10 @@ def cmd_gui(args) -> int:
 
 
 def _safe_streams() -> None:
+    # Windows pipes and redirected output default to the ANSI code page, which cannot encode Cyrillic.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
 
