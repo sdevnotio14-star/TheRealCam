@@ -4,10 +4,13 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
+/** Strip pixel whose source lies outside the frame (locally aligned layers); decoded pixels are opaque. */
+internal const val MISSING = 0
+
 /**
  * Full-resolution pixels of one frame for the current output strip, already positioned:
- * output pixel (x, y) is covered iff outX0 <= x < outX0 + width and outY0 <= y < outY0 + height,
- * and its value is pixels[(y - outY0) * stride + (x - outX0)].
+ * output pixel (x, y) is covered iff outX0 <= x < outX0 + width and outY0 <= y < outY0 + height
+ * and its value pixels[(y - outY0) * stride + (x - outX0)] is not [MISSING].
  */
 internal class FrameStrip(capacity: Int = 0) {
     var pixels = IntArray(capacity)
@@ -72,6 +75,7 @@ internal object StripKernels {
                 for (j in 0 until m) {
                     if (x < xa[j] || x >= xb[j]) continue
                     val c = px[j]!![rowBase[j] + x]
+                    if (c == MISSING) continue
                     argb[n] = c
                     val l = luma8(c)
                     lum[n] = l
@@ -163,6 +167,7 @@ internal object StripKernels {
             val o = r * width
             for (x in xa until xb) {
                 val c = p[base + x]
+                if (c == MISSING) continue
                 val i = o + x
                 sumR[i] += (c ushr 16) and 0xFF
                 sumG[i] += (c ushr 8) and 0xFF
@@ -185,7 +190,7 @@ internal object StripKernels {
         }
     }
 
-    /** Per-channel maximum into packed RGB accumulators (LIGHTEN); accumulators start at 0. */
+    /** Per-channel maximum into packed RGB accumulators (LIGHTEN); accumulators start at 0, so [MISSING] adds nothing. */
     fun accumulateMax(l: FrameStrip, y0: Int, rowFrom: Int, rowTo: Int, width: Int, acc: IntArray) {
         if (l.height == 0) return
         val xa = max(0, l.outX0)
