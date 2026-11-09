@@ -4,6 +4,7 @@ import com.therealcam.camera.ExposureScale
 import com.therealcam.camera.FocusMode
 import com.therealcam.camera.ShotSettings
 import com.therealcam.data.Profile
+import com.therealcam.data.UserPreset
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -120,5 +121,28 @@ object PresetPlanner {
         val settings = ShotSettings(iso = iso, exposureNs = expNs, focus = focus, frames = r.frames, stackMode = stack)
         val frames = if (r.frames > 1) "${r.frames} × " else ""
         return Plan(settings, "$frames${ExposureScale.formatShutter(expNs)} · ISO$iso$inf", r.hint, r.needsTripod)
+    }
+
+    /** A user preset as saved, limited to what this camera can do. */
+    fun planUser(u: UserPreset, i: Input): Plan {
+        var s = u.settings()
+        val iso = s.iso
+        val exp = s.exposureNs
+        s = if (!i.manualSensor || iso == null || exp == null || i.minIso == null || i.maxIso == null || i.maxExpNs == null) {
+            s.copy(iso = null, exposureNs = null)
+        } else {
+            s.copy(iso = iso.coerceIn(i.minIso, i.maxIso), exposureNs = exp.coerceIn(i.minExpNs ?: 0L, i.maxExpNs))
+        }
+        if (s.focus != FocusMode.AUTO && !i.canFocusInfinity) s = s.copy(focus = FocusMode.AUTO)
+        val expS = (s.exposureNs ?: 0L) / 1e9
+        val tripod = expS >= 1.0 / 15 || (s.frames > 1 && expS * s.frames >= 1.0)
+        val label = buildString {
+            if (s.frames > 1) append("${s.frames} × ")
+            append(s.exposureNs?.let { ExposureScale.formatShutter(it) } ?: "авто")
+            s.iso?.let { append(" · ISO$it") }
+            if (s.focus == FocusMode.INFINITY) append(" · ∞")
+            if (s.exposureNs == null && s.ev != 0f) append(" · EV%+.1f".format(s.ev))
+        }
+        return Plan(s, label, "Ваш пресет «${u.name}». Удалить — долгое нажатие на значок", tripod)
     }
 }
