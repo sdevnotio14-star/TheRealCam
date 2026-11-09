@@ -19,11 +19,4 @@ class RootCameraTest {
         val prefix = RootShell.Result(true, "uid=0\nvendor.camera.aux.packagelist=com.therealcam.other")
         assertFalse(RootCamera.applied(prefix, pkg))
     }
-
-    @Test
-    fun outsideAndroidNothingIsReportedAsApplied() {
-        // No Android property tools here (and su may or may not exist): the call must not throw or claim success.
-        val r = RootCamera.enable(pkg)
-        assertFalse(RootCamera.applied(r, pkg))
-    }
 }

@@ -21,9 +21,13 @@ import com.therealcam.camera.Lens
 import com.therealcam.camera.LensCatalog
 import com.therealcam.camera.LensKind
 import com.therealcam.camera.LensSpec
+import com.therealcam.capture.PresetPlanner
+import com.therealcam.capture.ScenePreset
 import com.therealcam.ui.camera.AstroControls
 import com.therealcam.ui.camera.ModeSwitcher
+import com.therealcam.ui.camera.PresetControls
 import com.therealcam.ui.camera.ZoomBar
+import com.therealcam.ui.common.GuideScreen
 import com.therealcam.ui.onboarding.OnboardingScreen
 import com.therealcam.ui.theme.RealColors
 import com.therealcam.ui.theme.RealTheme
@@ -137,4 +141,20 @@ class ScreenshotTest {
             AstroPanel("Бюджетный сенсор: выдержка до 0,5 с", astroPlan(0.5), steady = true, voice = true)
         }
     }
+
+    @Test
+    fun presetControls() = shot("preset_controls") {
+        val input = PresetPlanner.Input(
+            manualSensor = true, minExpNs = 100_000L, maxExpNs = 30_000_000_000L, minIso = 50, maxIso = 6400,
+            canFocusInfinity = true, aperture = 1.8f, previewExpNs = 100_000_000L, previewIso = 3200,
+            previewMeanLin = 0.02, steady = false,
+        )
+        Column(Modifier.background(Color.Black).fillMaxWidth().padding(vertical = 10.dp)) {
+            PresetControls(ScenePreset.NIGHT, PresetPlanner.plan(ScenePreset.NIGHT, input), steady = false, orientation = 0f, onPreset = {})
+            ModeSwitcher(CameraMode.PRESET, enabled = true, onMode = {})
+        }
+    }
+
+    @Test
+    fun guide() = shot("guide") { GuideScreen(onBack = {}) }
 }

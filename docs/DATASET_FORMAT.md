@@ -64,7 +64,7 @@ x вправо, y вверх, z из экрана, в естественной �
     "exposure_range_ns": [10000, 500000000], "min_focus_distance_diopters": 10.0
   },
 
-  "mode": "manual",                       // auto | manual | astro | ai
+  "mode": "manual",                       // auto | manual | preset | astro | ai
 
   "photo": {
     "role": "single",                     // single | series_frame | series_result
@@ -93,7 +93,8 @@ x вправо, y вверх, z из экрана, в естественной �
     "category_hint": "cat_7f3a",          // категория, выбранная ДО снимка (может быть null)
     "lens": "main",                       // ultrawide | main | tele | macro | front
     "zoom": 1.0,                          // угол обзора относительно основного объектива этой стороны (0.6, 1, 2.5…)
-    "equiv_focal_mm": 24.4                // эквивалентное фокусное расстояние (35 мм) при этом зуме
+    "equiv_focal_mm": 24.4,               // эквивалентное фокусное расстояние (35 мм) при этом зуме
+    "preset": null                        // сцена режима СЦЕНЫ: night | clouds | sunset | moon | trails | water | action | document
   },
 
   "series": {                             // null для одиночного снимка
