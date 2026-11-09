@@ -18,7 +18,7 @@ internal class FrameStats(
 internal class FrameSelection(
     /** Reject reason per frame position, null = accepted. */
     val reasons: Array<String?>,
-    /** Position of the reference (sharpest accepted) frame; always accepted. */
+    /** Position of the reference frame (sharpest accepted, or the middle one); always accepted. */
     val reference: Int,
 ) {
     val accepted: List<Int> get() = reasons.indices.filter { reasons[it] == null }
@@ -37,6 +37,8 @@ internal object FrameSelector {
         rejectOutliers: Boolean,
         maxMotionRadS: Double,
         luckyKeepFraction: Float,
+        /** Reference = accepted frame nearest the middle of the series (local alignment: halves the drift). */
+        middleReference: Boolean = false,
     ): FrameSelection {
         val n = stats.size
         require(n > 0) { "No frames" }
@@ -66,7 +68,13 @@ internal object FrameSelector {
         }
 
         val accepted = reasons.indices.filter { reasons[it] == null }
-        val reference = sharpest(stats, accepted)
+        // LUCKY/BEST_OF keep only the sharpest frames, so their reference must be the sharpest.
+        val reference = if (middleReference && mode != StackMode.LUCKY && mode != StackMode.BEST_OF) {
+            val span = accepted.first() + accepted.last()
+            accepted.minWith(compareBy<Int> { abs(2 * it - span) }.thenByDescending { stats[it].sharpness })
+        } else {
+            sharpest(stats, accepted)
+        }
 
         when (mode) {
             StackMode.LUCKY -> {
